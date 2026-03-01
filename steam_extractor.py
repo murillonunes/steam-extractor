@@ -4,6 +4,7 @@ Steam Extractor - Extracts game reviews from Steam.
 """
 
 import argparse
+import requests
 from pathlib import Path
 from datetime import datetime, date
 
@@ -22,6 +23,8 @@ LANGUAGE_MAP = {
     "zh": "schinese",
     "ko": "koreana"
 }
+
+BASE_URL = "https://store.steampowered.com/appreviews/"
 
 def map_language(user_lang: str) -> str:
     """
@@ -63,6 +66,42 @@ def validate_date_range(start: date, end: date) -> bool:
     """
     return start <= end
 
+def fetch_first_page(appid: str, language: str) -> dict:
+    """
+    Fetches first page of reviews from Steam API.
+
+    Args:
+        appid: Game ID
+        language: Steam language code
+
+    Returns:
+        JSON response from Steam API
+    """
+    params = {
+        "json": 1,
+        "language": language,
+        "filter": "all",
+        "review_type": "all",
+        "purchase_type": "all",
+        "num_per_page": 10, # First page only
+        "cursor": "*"       # First page marker
+    }
+
+    try:
+        response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("success") != 1:
+            raise ValueError(f"Steam API error: {data}")
+        
+        return data
+    
+    except requests.RequestException as e:
+        raise ConnectionError(f"HTTP request failed: {e}")
+    except ValueError as e:
+        raise ValueError(f"Steam API error: {e}")
+
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(
@@ -99,14 +138,29 @@ Exemples:
         print(f"Error: {e}")
         return 1
 
-    print("Steam Extractor v0.4.0")
+    print("Steam Extractor v0.5.0")
     print(f"Game ID: {args.appid}")
-    print(f"Input language: {args.language}")
-    print(f"Steam language: {steam_lang}")
+    print(f"Language: {steam_lang}")
     print(f"Date range: {args.start_date} to {args.end_date}")
-    print(f"Period: {start_date} to {end_date}")
-    print("Language mapping completed!")
-    print("Date parsing completed!")
+
+    # Fetch first page from Steam API
+    try:
+        print("Fetching first page from Steam API...")
+        api_data = fetch_first_page(args.appid, steam_lang)
+
+        total_reviews = api_data.get("query_summary", {}).get("total_reviews", 0)
+        review_score_desc = api_data.get("query_summary", {}).get("review_score_desc", "Unknown")
+
+        print("API Success!")
+        print(f"Total reviews: {total_reviews:,}")
+        print(f"Score: {review_score_desc}")
+        print(f"First page: {len(api_data.get('reviews', []))} reviews")
+    
+    except Exception as e:
+        print(f"API error: {e}")
+        return 1
+    
+    return 0
 
 if __name__ == "__main__":
     main()
