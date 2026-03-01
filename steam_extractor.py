@@ -5,6 +5,7 @@ Steam Extractor - Extracts game reviews from Steam.
 
 import argparse
 import requests
+import json
 from pathlib import Path
 from datetime import datetime, date
 
@@ -125,6 +126,33 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 50000) -> li
 
     return all_reviews
 
+def save_reviews(reviews: list, appid: str, language: str, 
+                 start_date: str, end_date: str) -> str:
+    """
+    Saves reviews to JSON file with automatic filename.
+
+    Args:
+        reviews: list of review dicts
+        appid, language, dates: for filename
+
+    Returns:
+        Filename created
+    """
+    # Clean filename
+    safe_lang = language.replace("/", "_")
+    safe_start = start_date.replace("/", "-")
+    safe_end = end_date.replace("/", "-")
+
+    filename = f"reviews_{appid}_{safe_lang}_{safe_start}_{safe_end}.json"
+
+    # Sabe with pretty formatting
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(reviews, f, ensure_ascii=False, indent=2)
+
+    filesize = Path(filename).stat().st_size / 1024 # KB
+    print(f"Saved: {filename} ({filesize:.1f} KB)")
+    return filename
+
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(
@@ -174,10 +202,16 @@ Exemples:
         print("Pagination complete!")
         print(f"Total reviews fetched: {len(all_reviews):,}")
 
-        # Show summary
         if all_reviews:
             first_review = all_reviews[0]
             print(f"Sample: {first_review.get('review', 'N/A')[:100]}...")
+        
+        # Save to JSON
+        filename = save_reviews(
+            all_reviews, args.appid, steam_lang, 
+            args.start_date, args.end_date
+        )
+        print(f"Complete! Check: {filename}")
     
     except Exception as e:
         print(f"Fetch error: {e}")

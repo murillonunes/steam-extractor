@@ -31,3 +31,9 @@ wheels/
 
 # Dados sensíveis
 .env
+
+# Dados gerados
+*.json
+reeviews_*.json
+data/
+output/
