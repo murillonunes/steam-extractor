@@ -66,41 +66,64 @@ def validate_date_range(start: date, end: date) -> bool:
     """
     return start <= end
 
-def fetch_first_page(appid: str, language: str) -> dict:
+def fetch_all_reviews(appid: str, language: str, max_reviews: int = 50000) -> list:
     """
-    Fetches first page of reviews from Steam API.
+    Fetches ALL reviews using cursor pagination.
 
     Args:
         appid: Game ID
-        language: Steam language code
+        language: Steam language
+        max_reviews: safety limit to prevent infinite loops
 
     Returns:
-        JSON response from Steam API
+        List of ALL reviews dicts
     """
-    params = {
-        "json": 1,
-        "language": language,
-        "filter": "all",
-        "review_type": "all",
-        "purchase_type": "all",
-        "num_per_page": 10, # First page only
-        "cursor": "*"       # First page marker
-    }
+    cursor = "*"
+    all_reviews = []
+    num_per_page = 100
+    seen_cursors = set() # Prevent infinite loops
 
-    try:
-        response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    print("    Fetching ALL reviews with pagination...")
 
-        if data.get("success") != 1:
-            raise ValueError(f"Steam API error: {data}")
-        
-        return data
-    
-    except requests.RequestException as e:
-        raise ConnectionError(f"HTTP request failed: {e}")
-    except ValueError as e:
-        raise ValueError(f"Steam API error: {e}")
+    while len(all_reviews) < max_reviews:
+        params = {
+            "json": 1,
+            "language": language,
+            "filter": "all",
+            "review_type": "all",
+            "purchase_type": "all",
+            "num_per_page": num_per_page,
+            "cursor": cursor
+        }
+
+        try:
+            response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
+            data = response.json()
+
+            if data.get("success") != 1:
+                print("API returned no more data")
+                break
+
+            page_reviews = data.get("reviews", [])
+            if not page_reviews:
+                break
+
+            all_reviews.extend(page_reviews)
+            cursor = data.get("cursor")
+
+            # Safety checks
+            if cursor in seen_cursors or cursor is None:
+                print("Cursor loop detected or None")
+                break
+            seen_cursors.add(cursor)
+
+            print(f"Page complete: {len(all_reviews):,} total reviews")
+
+        except Exception as e:
+            print(f"Pagination error: {e}")
+            break
+
+    return all_reviews
 
 def main():
     # Create argument parser
@@ -143,21 +166,21 @@ Exemples:
     print(f"Language: {steam_lang}")
     print(f"Date range: {args.start_date} to {args.end_date}")
 
-    # Fetch first page from Steam API
+    # Fetch ALL reviews
     try:
-        print("Fetching first page from Steam API...")
-        api_data = fetch_first_page(args.appid, steam_lang)
+        print("    Fetching ALL reviews...")
+        all_reviews = fetch_all_reviews(args.appid, steam_lang)
 
-        total_reviews = api_data.get("query_summary", {}).get("total_reviews", 0)
-        review_score_desc = api_data.get("query_summary", {}).get("review_score_desc", "Unknown")
+        print("Pagination complete!")
+        print(f"Total reviews fetched: {len(all_reviews):,}")
 
-        print("API Success!")
-        print(f"Total reviews: {total_reviews:,}")
-        print(f"Score: {review_score_desc}")
-        print(f"First page: {len(api_data.get('reviews', []))} reviews")
+        # Show summary
+        if all_reviews:
+            first_review = all_reviews[0]
+            print(f"Sample: {first_review.get('review', 'N/A')[:100]}...")
     
     except Exception as e:
-        print(f"API error: {e}")
+        print(f"Fetch error: {e}")
         return 1
     
     return 0
