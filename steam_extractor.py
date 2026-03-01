@@ -6,8 +6,10 @@ Steam Extractor - Extracts game reviews from Steam.
 import argparse
 import requests
 import json
+import time
 from pathlib import Path
 from datetime import datetime, date, timezone
+from typing import List
 
 LANGUAGE_MAP = {
     "all": "all",
@@ -67,9 +69,9 @@ def validate_date_range(start: date, end: date) -> bool:
     """
     return start <= end
 
-def fetch_all_reviews(appid: str, language: str, max_reviews: int = 50000) -> list:
+def fetch_all_reviews(appid: str, language: str, max_reviews: int = 50000) -> List[dict]:
     """
-    Fetches ALL reviews using cursor pagination.
+    Robust pagination - fetches ALL reviews with retries.
 
     Args:
         appid: Game ID
@@ -83,46 +85,63 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 50000) -> li
     all_reviews = []
     num_per_page = 100
     seen_cursors = set() # Prevent infinite loops
+    retry_count = 0
+    max_retries = 5
 
     print("    Fetching ALL reviews with pagination...")
 
     while len(all_reviews) < max_reviews:
-        params = {
-            "json": 1,
-            "language": language,
-            "filter": "all",
-            "review_type": "all",
-            "purchase_type": "all",
-            "num_per_page": num_per_page,
-            "cursor": cursor
-        }
+        for attempt in range(max_retries):
+            params = {
+                "json": 1,
+                "language": language,
+                "filter": "all",
+                "review_type": "all",
+                "purchase_type": "all",
+                "num_per_page": num_per_page,
+                "cursor": cursor
+            }
 
-        try:
-            response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
-            data = response.json()
+            try:
+                response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
+                data = response.json()
 
-            if data.get("success") != 1:
-                print("API returned no more data")
-                break
+                if data.get("success") == 1:
+                    page_reviews = data.get("reviews", [])
+                    if page_reviews:
+                        all_reviews.extend(page_reviews)
+                        cursor = data.get("cursor", "*")
 
-            page_reviews = data.get("reviews", [])
-            if not page_reviews:
-                break
+                        # Reset retry on success
+                        retry_count = 0
 
-            all_reviews.extend(page_reviews)
-            cursor = data.get("cursor")
+                        print(f"Page: {len(all_reviews):,} reviews (cursor: {cursor[:20]}...)")
+                        break # Success, next page
+                    else:
+                        print("No more reviews")
+                        return all_reviews
+                else:
+                    raise ValueError(f"API error: {data}")
 
-            # Safety checks
-            if cursor in seen_cursors or cursor is None:
-                print("Cursor loop detected or None")
-                break
-            seen_cursors.add(cursor)
-
-            print(f"Page complete: {len(all_reviews):,} total reviews")
-
-        except Exception as e:
-            print(f"Pagination error: {e}")
+            except Exception as e:
+                retry_count += 1
+                wait_time = 2 ** attempt # 1s, 2s, 4s, 8s...
+                print(f"Retry {attempt+1}/{max_retries}: {e} (wait {wait_time}s)")
+                time.sleep(wait_time)
+                continue
+        
+        else:
+            # All retries failed
+            print("Max retries exceeded")
             break
+
+        # Rate limiting + cursor safety
+        if cursor in seen_cursors:
+            print("Cursor loop detected - slowing down")
+            time.sleep(2)
+        seen_cursors.add(cursor)
+
+        time.sleep(0.5) # Gentle rate limiting
 
     return all_reviews
 
@@ -145,7 +164,7 @@ def save_reviews(reviews: list, appid: str, language: str,
 
     filename = f"reviews_{appid}_{safe_lang}_{safe_start}_{safe_end}.json"
 
-    # Sabe with pretty formatting
+    # Save with pretty formatting
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(reviews, f, ensure_ascii=False, indent=2)
 
@@ -215,7 +234,7 @@ Exemples:
         print(f"Error: {e}")
         return 1
 
-    print("Steam Extractor v0.5.0")
+    print("Steam Extractor v0.8.0")
     print(f"Game ID: {args.appid}")
     print(f"Language: {steam_lang}")
     print(f"Date range: {args.start_date} to {args.end_date}")
@@ -246,7 +265,7 @@ Exemples:
         
             # Save filtered reviews
             filename = save_reviews(
-                all_reviews, args.appid, steam_lang, 
+                filtered_reviews, args.appid, steam_lang, 
                 args.start_date, args.end_date
             )
             print(f"Complete! {len(filtered_reviews):,} reviews saved.")
