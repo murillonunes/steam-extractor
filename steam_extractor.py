@@ -7,7 +7,7 @@ import argparse
 import requests
 import json
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 LANGUAGE_MAP = {
     "all": "all",
@@ -153,6 +153,32 @@ def save_reviews(reviews: list, appid: str, language: str,
     print(f"Saved: {filename} ({filesize:.1f} KB)")
     return filename
 
+def filter_reviews_by_date(reviews: list, start_date: date, end_date: date) -> list:
+    """
+    Filters reviews by timestamp_created date range.
+
+    Args:
+        reviews: full list of reviews
+        start_date, end_date: date objects
+
+    Returns:
+        Filtered reviews within date range
+    """
+    filtered = []
+
+    for review in reviews:
+        timestamp = review.get("timestamp_created")
+        if timestamp is None:
+            continue
+
+        # Convert Unix timestamp to date
+        review_date = datetime.fromtimestamp(timestamp, timezone.utc).date()
+
+        if start_date <= review_date <= end_date:
+            filtered.append(review)
+    
+    return filtered
+
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(
@@ -202,16 +228,30 @@ Exemples:
         print("Pagination complete!")
         print(f"Total reviews fetched: {len(all_reviews):,}")
 
-        if all_reviews:
-            first_review = all_reviews[0]
-            print(f"Sample: {first_review.get('review', 'N/A')[:100]}...")
-        
-        # Save to JSON
-        filename = save_reviews(
-            all_reviews, args.appid, steam_lang, 
-            args.start_date, args.end_date
+        # Filter by date range
+        print("    Filtering by date range...")
+        filtered_reviews = filter_reviews_by_date(
+            all_reviews, start_date, end_date
         )
-        print(f"Complete! Check: {filename}")
+
+        print(f"Filtered reviews: {len(filtered_reviews):,}")
+
+        if filtered_reviews:
+            # Show sample
+            sample = filtered_reviews[0]
+            sample_date = datetime.fromtimestamp(
+                sample["timestamp_created"], timezone.utc
+            ).strftime("%Y-%m-%d")
+            print(f"Sample ({sample_date}): {sample.get('review', 'N/A')[:80]}...")
+        
+            # Save filtered reviews
+            filename = save_reviews(
+                all_reviews, args.appid, steam_lang, 
+                args.start_date, args.end_date
+            )
+            print(f"Complete! {len(filtered_reviews):,} reviews saved.")
+        else:
+            print("No reviews found in date range")
     
     except Exception as e:
         print(f"Fetch error: {e}")
