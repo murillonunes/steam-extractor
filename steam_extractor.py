@@ -8,9 +8,8 @@ import requests
 import json
 import time
 import pandas as pd
-from pathlib import Path
 from datetime import datetime, date, timezone
-from typing import List
+from typing import List, Dict
 
 LANGUAGE_MAP = {
     "all": "all",
@@ -60,17 +59,17 @@ def parse_date(date_str: str) -> date:
         return datetime.strptime(date_str, "%d/%m/%Y").date()
     except ValueError:
         raise ValueError(f"Invalid date format. Use dd/mm/yyyy (e.g. 30/12/2021)")
-    
-def validate_date_range(start: date, end: date) -> bool:
-    """
-    Validates start_date <= end_date.
 
-    Returns:
-        True if valid
+def timestamp_to_ddmmyyyy(timestamp: int | None) -> str | None:
     """
-    return start <= end
+    Convert Unix timestamp to dd/mm/yyyy string (UTC timezone).
+    """
+    if timestamp is None:
+        return None
+    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).date()
+    return dt.strftime("%d/%m/%Y")
 
-def fetch_all_reviews(appid: str, language: str, max_reviews: int = 200000) -> List[dict]:
+def fetch_all_reviews(appid: str, language: str, max_reviews: int = 2000000) -> List[dict]:
     """
     Robust pagination - fetches ALL reviews with retries.
 
@@ -89,6 +88,8 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 200000) -> L
     max_retries = 5
 
     print("    Fetching ALL reviews with pagination...")
+
+    last_progress = 0
 
     while len(all_reviews) < max_reviews:
         for attempt in range(max_retries):
@@ -112,7 +113,10 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 200000) -> L
                         all_reviews.extend(page_reviews)
                         cursor = data.get("cursor", "*")
 
-                        print(f"Page: {len(all_reviews):,} reviews (cursor: {cursor[:20]}...)")
+                        milestone = (len(all_reviews) // 500) * 500
+                        if milestone > last_progress:
+                            print(f"Progress: {len(all_reviews):,} reviews fetched...")
+                            last_progress = milestone
                         break
                     else:
                         print("No more reviews")
@@ -132,71 +136,57 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 200000) -> L
 
         # Rate limiting + cursor safety
         if cursor in seen_cursors:
-            print("Cursor loop detected - slowing down")
+            print("Cursor loop detected - slowing down...")
             time.sleep(2)
         seen_cursors.add(cursor)
-
         time.sleep(0.5)
 
     return all_reviews
 
-def save_reviews(reviews: list, appid: str, language: str, 
-                 start_date: str, end_date: str, fmt: str) -> str:
+def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
     """
-    Saves reviews to JSON or CSV file with automatic filename.
+    Save reviews to JSON or CSV with timestamps converted to dd/mm/yyyy.
 
     Args:
         reviews: list of review dicts
-        appid, language, dates: for filename
-
-    Returns:
-        Filename created
+        filename: base filename (auto-append .json or .csv)
+        format_type: 'json' or 'csv'
     """
-    safe_lang = language.replace("/", "_")
-    safe_start = start_date.replace("/", "-")
-    safe_end = end_date.replace("/", "-")
+    processed_reviews = []
+    for r in reviews:
+        processed = r.copy()
+        # Convert all timestamps to dd/mm/yyyy strings
+        processed['date_created'] = timestamp_to_ddmmyyyy(r.get('timestamp_created'))
+        processed['date_updated'] = timestamp_to_ddmmyyyy(r.get('timestamp_updated'))
+        release_ts = r.get('release_date', {}).get('date')
+        processed['date_release'] = timestamp_to_ddmmyyyy(release_ts)
+        author = processed.setdefault('author', {})
+        author['last_played_date'] = timestamp_to_ddmmyyyy(author.get('last_played'))
+        processed_reviews.append(processed)
 
-    if fmt == "json":
-        filename = f"reviews_{appid}_{safe_lang}_{safe_start}_{safe_end}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(reviews, f, ensure_ascii=False, indent=2)
-        
-        filesize = Path(filename).stat().st_size / 1024
-        print(f"JSON: {filename} ({filesize:.1f} KB)")
-    
-    elif fmt == "csv":
-        filename = f"reviews_{appid}_{safe_lang}_{safe_start}_{safe_end}.csv"
-        df = pd.json_normalize(reviews)
-        df.to_csv(filename, index=False, encoding="utf-8")
+    if format_type == 'csv':
+        df = pd.json_normalize(processed_reviews)
+        output_file = f"{filename}.csv"
+        df.to_csv(output_file, index=False, encoding="utf-8")
+        print(f"Saved CSV: {output_file} ({len(df)} rows, {len(df.columns)} columns)")
+    else:
+        output_file = f"{filename}.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(processed_reviews, f, ensure_ascii=False, indent=2)
+        print(f"Saved JSON: {output_file} ({len(processed_reviews)} reviews)")
 
-        filesize = Path(filename).stat().st_size / 1024
-        print(f"CSV: {filename} ({filesize:.1f} KB, {len(df)} rows)")
-
-    return filename
-
-def filter_reviews_by_date(reviews: list, start_date: date, end_date: date) -> list:
+def filter_reviews_by_date(reviews: List[Dict], start_date: date, end_date: date) -> List[Dict]:
     """
-    Filters reviews by timestamp_created date range.
-
-    Args:
-        reviews: full list of reviews
-        start_date, end_date: date objects
-
-    Returns:
-        Filtered reviews within date range
+    Filter reviews within date range using timestamp_created.
     """
     filtered = []
-
     for review in reviews:
-        timestamp = review.get("timestamp_created")
-        if timestamp is None:
+        ts = review.get('timestamp_created')
+        if ts is None:
             continue
-
-        review_date = datetime.fromtimestamp(timestamp, timezone.utc).date()
-
+        review_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
         if start_date <= review_date <= end_date:
             filtered.append(review)
-    
     return filtered
 
 def main():
@@ -230,7 +220,7 @@ Exemples:
         start_date = parse_date(args.start_date)
         end_date = parse_date(args.end_date)
 
-        if not validate_date_range(start_date, end_date):
+        if start_date > end_date:
             raise ValueError("start_date must be before or equal to end_date")
         
     except ValueError as e:
@@ -263,11 +253,12 @@ Exemples:
             ).strftime("%Y-%m-%d")
             print(f"Sample ({sample_date}): {sample.get('review', 'N/A')[:80]}...")
         
-            # Save filtered reviews with user format
-            filename = save_reviews(
-                filtered_reviews, args.appid, steam_lang, 
-                args.start_date, args.end_date, args.format
-            )
+            safe_start = args.start_date.replace("/", "-")
+            safe_end = args.end_date.replace("/", "-")            
+            save_reviews(filtered_reviews, 
+                         f"reviews_{args.appid}_{steam_lang}_{safe_start}_{safe_end}", 
+                         args.format)
+
             print(f"Complete! {len(filtered_reviews):,} reviews saved.")
         else:
             print("No reviews found in date range")
