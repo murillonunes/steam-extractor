@@ -60,14 +60,17 @@ def parse_date(date_str: str) -> date:
     except ValueError:
         raise ValueError(f"Invalid date format. Use dd/mm/yyyy (e.g. 30/12/2021)")
 
-def timestamp_to_ddmmyyyy(timestamp: int | None) -> str | None:
+def timestamp_to_ddmmyyyy(timestamp: int | str | None) -> str | None:
     """
     Convert Unix timestamp to dd/mm/yyyy string (UTC timezone).
     """
     if timestamp is None:
         return None
-    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).date()
-    return dt.strftime("%d/%m/%Y")
+    try:
+        dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).date()
+        return dt.strftime("%d/%m/%Y")
+    except (ValueError, TypeError, OSError):
+        return None
 
 def fetch_all_reviews(appid: str, language: str, max_reviews: int = 2000000) -> List[dict]:
     """
@@ -158,7 +161,7 @@ def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
         # Convert all timestamps to dd/mm/yyyy strings
         processed['date_created'] = timestamp_to_ddmmyyyy(r.get('timestamp_created'))
         processed['date_updated'] = timestamp_to_ddmmyyyy(r.get('timestamp_updated'))
-        release_ts = r.get('release_date', {}).get('date')
+        release_ts = r.get('app_release_date')
         processed['date_release'] = timestamp_to_ddmmyyyy(release_ts)
         author = processed.setdefault('author', {})
         author['last_played_date'] = timestamp_to_ddmmyyyy(author.get('last_played'))
