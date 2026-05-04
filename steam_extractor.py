@@ -80,15 +80,17 @@ def fetch_reviews_by_date_range(
         max_reviews: int = 2000000
     ) -> List[dict]:
     """
-    Robust pagination - fetches ALL reviews with retries.
+    Fetch reviews with pagination and early stop based on date range.
 
     Args:
         appid: Game ID
         language: Steam language
+        start_date: initial date for filtering reviews
+        end_date: final date for filtering reviews
         max_reviews: safety limit to prevent infinite loops
 
     Returns:
-        List of ALL reviews dicts
+        List of reviews within the requested date range
     """
     cursor = "*"
     collected_reviews = []
