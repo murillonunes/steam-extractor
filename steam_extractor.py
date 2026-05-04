@@ -72,7 +72,13 @@ def timestamp_to_ddmmyyyy(timestamp: int | str | None) -> str | None:
     except (ValueError, TypeError, OSError):
         return None
 
-def fetch_all_reviews(appid: str, language: str, max_reviews: int = 2000000) -> List[dict]:
+def fetch_reviews_by_date_range(
+        appid: str, 
+        language: str, 
+        start_date: date,
+        end_date: date,
+        max_reviews: int = 2000000
+    ) -> List[dict]:
     """
     Robust pagination - fetches ALL reviews with retries.
 
@@ -85,16 +91,17 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 2000000) -> 
         List of ALL reviews dicts
     """
     cursor = "*"
-    all_reviews = []
+    collected_reviews = []
     num_per_page = 100
     seen_cursors = set()
     max_retries = 5
-
-    print("    Fetching ALL reviews with pagination...")
-
     last_progress = 0
 
-    while len(all_reviews) < max_reviews:
+    print("    Fetching reviews with early date filtering...")
+
+    while len(collected_reviews) < max_reviews:
+        page_reviews = None
+
         for attempt in range(max_retries):
             params = {
                 "json": 1,
@@ -103,48 +110,67 @@ def fetch_all_reviews(appid: str, language: str, max_reviews: int = 2000000) -> 
                 "review_type": "all",
                 "purchase_type": "all",
                 "num_per_page": num_per_page,
-                "cursor": cursor
+                "cursor": cursor,
             }
 
             try:
                 response = requests.get(f"{BASE_URL}{appid}", params=params, timeout=30)
                 data = response.json()
 
-                if data.get("success") == 1:
-                    page_reviews = data.get("reviews", [])
-                    if page_reviews:
-                        all_reviews.extend(page_reviews)
-                        cursor = data.get("cursor", "*")
-
-                        milestone = (len(all_reviews) // 500) * 500
-                        if milestone > last_progress:
-                            print(f"Progress: {len(all_reviews):,} reviews fetched...")
-                            last_progress = milestone
-                        break
-                    else:
-                        print("No more reviews")
-                        return all_reviews
-                else:
+                if data.get("success") != 1:
                     raise ValueError(f"API error: {data}")
+                
+                page_reviews = data.get("reviews", [])
+                next_cursor = data.get("cursor", "*")
+                break
 
             except Exception as e:
-                wait_time = 2 ** attempt # 1s, 2s, 4s, 8s...
-                print(f"Retry {attempt+1}/{max_retries}: {e} (wait {wait_time}s)")
+                wait_time = 2 ** attempt
+                print(f"Retry {attempt + 1}/{max_retries}: {e} (wait {wait_time}s)")
                 time.sleep(wait_time)
-                continue
         
         else:
             print("Max retries exceeded")
             break
 
-        # Rate limiting + cursor safety
+        if not page_reviews:
+            print("No more reivews")
+            break
+
+        page_has_in_range = False
+        page_has_older_than_start = False
+
+        for review in page_reviews:
+            ts = review.get("timestamp_created")
+            if ts is None:
+                continue
+
+            review_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+
+            if start_date <= review_date <= end_date:
+                collected_reviews.append(review)
+                page_has_in_range = True
+            elif review_date < start_date:
+                page_has_older_than_start = True
+        
+        milestone = (len(collected_reviews) // 100) * 100
+        if milestone > last_progress:
+            print(f"Progress: {len(collected_reviews):,} reviews in range collected...")
+            last_progress = milestone
+        
+        if page_has_older_than_start and not page_has_in_range:
+            print("Reached reviews older than start_date. Stopping early.")
+            break
+
+        cursor = next_cursor
         if cursor in seen_cursors:
-            print("Cursor loop detected - slowing down...")
-            time.sleep(2)
+            print("Cursor loop dtected. Stopping pagination.")
+            break
+
         seen_cursors.add(cursor)
         time.sleep(0.5)
 
-    return all_reviews
+    return collected_reviews
 
 def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
     """
@@ -193,7 +219,6 @@ def filter_reviews_by_date(reviews: List[Dict], start_date: date, end_date: date
     return filtered
 
 def main():
-    # Create argument parser
     parser = argparse.ArgumentParser(
         description="Steam Extractor - Extracts game reviews from Steam.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -216,7 +241,6 @@ Exemples:
     )
 
     args = parser.parse_args()
-
     steam_lang = map_language(args.language)
 
     try:
@@ -236,35 +260,35 @@ Exemples:
     print(f"Date range: {args.start_date} to {args.end_date}")
 
     try:
-        print("    Fetching ALL reviews...")
-        all_reviews = fetch_all_reviews(args.appid, steam_lang)
-
-        print("Pagination complete!")
-        print(f"Total reviews fetched: {len(all_reviews):,}")
-        
-        print("    Filtering by date range...")
-        filtered_reviews = filter_reviews_by_date(
-            all_reviews, start_date, end_date
+        print("    Fetching reviews in date range...")
+        filtered_reviews = fetch_reviews_by_date_range(
+            args.appid, 
+            steam_lang, 
+            start_date, 
+            end_date
         )
 
+        print("Pagination complete!")
         print(f"Filtered reviews: {len(filtered_reviews):,}")
-
+        
         if filtered_reviews:
             sample = filtered_reviews[0]
             sample_date = datetime.fromtimestamp(
-                sample["timestamp_created"], timezone.utc
+                sample["timestamp_created"],
+                tz=timezone.utc
             ).strftime("%Y-%m-%d")
+
             print(f"Sample ({sample_date}): {sample.get('review', 'N/A')[:80]}...")
-        
+
             safe_start = args.start_date.replace("/", "-")
-            safe_end = args.end_date.replace("/", "-")            
-            save_reviews(filtered_reviews, 
-                         f"reviews_{args.appid}_{steam_lang}_{safe_start}_{safe_end}", 
-                         args.format)
+            safe_end = args.end_date.replace("/", "-")
+            output_name = f"reviews_{args.appid}_{steam_lang}_{safe_start}_{safe_end}"
+            
+            save_reviews(filtered_reviews, output_name, args.format)
 
             print(f"Complete! {len(filtered_reviews):,} reviews saved.")
         else:
-            print("No reviews found in date range")
+            print("No reviews found in date range.")
     
     except Exception as e:
         print(f"Fetch error: {e}")
