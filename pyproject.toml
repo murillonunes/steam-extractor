@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steam-extractor"
+version = "1.0.0"
+description = "Extract Steam game reviews grouped by genre tag and country"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+steam-extractor      = "steam_extractor.tag_extractor:main"
+steam-reviews        = "steam_extractor.reviews_fetcher:main"
+steamspy-catalog     = "steam_extractor.catalog_fetcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

@@ -31,7 +31,7 @@ import pandas as pd
 from datetime import datetime, date, timezone
 from pathlib import Path
 
-from steam_reviews_fetcher import fetch_reviews_by_date_range, parse_date
+from steam_extractor.reviews_fetcher import fetch_reviews_by_date_range, parse_date
 
 log = logging.getLogger(__name__)
 
