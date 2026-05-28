@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import time
 import requests
 import pandas as pd
@@ -158,15 +159,16 @@ def fetch_country_codes(user_ids: list[str], api_key: str) -> dict[str, str]:
                     country_map[steamid] = country.upper() if country else ""
                 break
             except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
+                status = e.response.status_code if e.response is not None else "?"
+                if status == 429:
                     wait = 30 * (attempt + 1)
                     log.warning(f"Rate limited on batch {i} (attempt {attempt+1}/{max_retries}), waiting {wait}s...")
                     time.sleep(wait)
                 else:
-                    log.warning(f"Error in batch {i}: {e}")
+                    log.warning(f"HTTP {status} error on batch {i} (attempt {attempt+1}/{max_retries})")
                     break
             except Exception as e:
-                log.warning(f"Error in batch {i}: {e}")
+                log.warning(f"Error on batch {i}: {type(e).__name__} (attempt {attempt+1}/{max_retries})")
                 break
 
         if i % 10 == 0:
@@ -375,7 +377,8 @@ Examples:
                         help="ISO country codes to keep (e.g. BR US). Omit to keep all.")
     parser.add_argument("--start",       required=True, help="Start date dd/mm/yyyy")
     parser.add_argument("--end",         required=True, help="End date dd/mm/yyyy")
-    parser.add_argument("--api-key",     required=True, help="Steam Web API key")
+    parser.add_argument("--api-key",     default=None,
+                        help="Steam Web API key (or set STEAM_API_KEY env var)")
     parser.add_argument("--db",          default=DEFAULT_DB,
                         help=f"Path to local SteamSpy catalog (default: {DEFAULT_DB})")
     parser.add_argument("--appids",       nargs="+", default=None,
@@ -397,6 +400,11 @@ Examples:
                              "multiple high-volume games.")
 
     args = parser.parse_args()
+
+    api_key = args.api_key or os.environ.get("STEAM_API_KEY")
+    if not api_key:
+        print("Error: Steam API key required. Use --api-key or set STEAM_API_KEY env var.")
+        return 1
 
     log_file = setup_logging()
     log.info(f"Log file: {log_file}")
@@ -424,7 +432,7 @@ Examples:
         countries=args.countries,
         start_date=start_date,
         end_date=end_date,
-        api_key=args.api_key,
+        api_key=api_key,
         db_path=args.db,
         max_games_per_tag=args.max_games,
         min_reviews=args.min_reviews,
