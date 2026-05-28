@@ -1,4 +1,4 @@
-# Ambiente virtual
+# Virtual environment
 .venv/
 venv/
 env/
@@ -9,7 +9,6 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -28,12 +27,13 @@ wheels/
 
 # Logs
 *.log
+logs/
 
-# Dados sensíveis
+# Sensitive data
 .env
 
-# Dados gerados
+# Generated data / outputs
 *.json
-reeviews_*.json
+*.csv
 data/
 output/
