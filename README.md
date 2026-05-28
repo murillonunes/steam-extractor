@@ -2,18 +2,18 @@
 
 **Multi-tool suite for extracting and analyzing Steam game reviews**, with support for tag-based discovery, country filtering, and SteamSpy catalog integration.
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/github/license/murillonunes/steam-extractor)](LICENSE)
 
 ## Overview
 
-This project consists of three independent scripts that work together:
+This project is a Python package with three CLI tools that work together:
 
-| Script | Description |
-|--------|-------------|
-| `steamspy_catalog_fetcher.py` | Builds a local SteamSpy catalog with tags for all games (run once) |
-| `steam_reviews_fetcher.py` | Extracts reviews for a single game by appid, language and date range |
-| `steam_extractor.py` | Full pipeline: discovers games by tag, collects reviews, enriches with country |
+| Command | Description |
+|---------|-------------|
+| `steamspy-catalog` | Builds a local SteamSpy catalog with tags for all games (run once) |
+| `steam-reviews` | Extracts reviews for a single game by appid, language and date range |
+| `steam-extractor` | Full pipeline: discovers games by tag, collects reviews, enriches with country |
 
 ## Features
 
@@ -21,15 +21,14 @@ This project consists of three independent scripts that work together:
 - 🌍 **Country filtering** — keep only reviews from specific countries (via Steam Web API)
 - 📥 **Full review extraction** with robust pagination (`cursor`-based) and retry/backoff
 - 📅 **Date range filtering** with early-stop pagination to avoid unnecessary requests
-- 🔁 **Deduplication** by `recommendationid`
+- 🔁 **Multi-pass deduplication** — re-runs merged by `recommendationid` to recover reviews missed by cursor drift
 - 💾 **CSV / JSON output** via pandas
 - 🗂️ **Incremental catalog saves** — SteamSpy fetcher resumes interrupted runs
 - 🕐 Timestamps converted to `dd/mm/yyyy` readable format
 
 ## Requirements
 
-- Python 3.10+
-- pip packages: `requests`, `pandas`, `numpy`
+- Python 3.11+
 - A [Steam Web API key](https://steamcommunity.com/dev/apikey) (for country enrichment)
 
 ## Installation
@@ -39,7 +38,7 @@ git clone https://github.com/murillonunes/steam-extractor.git
 cd steam-extractor
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Usage
@@ -48,19 +47,19 @@ pip install -r requirements.txt
 
 ```bash
 # Quick test (~2,000 apps):
-python3 steamspy_catalog_fetcher.py --max-pages 2
+steamspy-catalog --max-pages 2
 
 # Full catalog (~24h, ~80,000 apps):
-python3 steamspy_catalog_fetcher.py
+steamspy-catalog
 
 # Resume an interrupted run:
-python3 steamspy_catalog_fetcher.py --resume
+steamspy-catalog --resume
 ```
 
 ### Step 2a — Extract reviews for a single game
 
 ```bash
-python3 steam_reviews_fetcher.py <appid> <language> <start_date> <end_date> [--format json|csv]
+steam-reviews <appid> <language> <start_date> <end_date> [--format json|csv] [--passes N]
 ```
 
 | Argument | Description | Example |
@@ -70,24 +69,27 @@ python3 steam_reviews_fetcher.py <appid> <language> <start_date> <end_date> [--f
 | `start_date` | Start date (dd/mm/yyyy) | `01/01/2021` |
 | `end_date` | End date (dd/mm/yyyy) | `31/12/2021` |
 | `--format` | Output format (default: `json`) | `json` or `csv` |
+| `--passes N` | Independent collection passes merged via deduplication (default: `1`). Use `3+` for high-volume games. | `3` |
 
 ```bash
 # Cyberpunk 2077 — Brazilian Portuguese reviews (2021) as CSV
-python3 steam_reviews_fetcher.py 1091500 pt-br 01/01/2021 31/12/2021 --format csv
+steam-reviews 1091500 pt-br 01/01/2021 31/12/2021 --format csv
 
-# CS2 — All languages (2024) as JSON
-python3 steam_reviews_fetcher.py 730 all 01/01/2024 31/12/2024
+# CS2 — All languages (2024), 3 passes for consistency
+steam-reviews 730 all 01/01/2024 31/12/2024 --passes 3
 
 # Elden Ring — English reviews (2022-2023) as CSV
-python3 steam_reviews_fetcher.py 1245620 en 01/01/2022 31/12/2023 --format csv
+steam-reviews 1245620 en 01/01/2022 31/12/2023 --format csv
 ```
 
 ### Step 2b — Extract reviews by tag + country (full pipeline)
 
 ```bash
-python3 steam_extractor.py --tags <TAG...> --countries <CC...> \
-    --start dd/mm/yyyy --end dd/mm/yyyy --api-key YOUR_KEY [options]
+steam-extractor --tags <TAG...> --countries <CC...> \
+    --start dd/mm/yyyy --end dd/mm/yyyy [--api-key YOUR_KEY] [options]
 ```
+
+The API key can also be provided via the `STEAM_API_KEY` environment variable instead of `--api-key`.
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -95,32 +97,35 @@ python3 steam_extractor.py --tags <TAG...> --countries <CC...> \
 | `--countries` | ISO country codes to filter | all countries |
 | `--start` | Start date (dd/mm/yyyy) | required |
 | `--end` | End date (dd/mm/yyyy) | required |
-| `--api-key` | Steam Web API key | required |
+| `--api-key` | Steam Web API key (or set `STEAM_API_KEY`) | — |
 | `--appids` | Skip catalog lookup, use explicit app IDs | — |
 | `--max-games` | Max games per tag | `10` |
 | `--min-reviews` | Min total reviews per game | `0` |
+| `--passes N` | Collection passes per game merged via deduplication (default: `1`). Use `3+` to recover reviews missed by cursor drift. | `1` |
+| `--game-delay S` | Seconds to wait between games (default: `1.5`). Increase to reduce session throttling when processing multiple high-volume games. | `1.5` |
 | `--format` | `csv` or `json` | `csv` |
 | `--output` | Output filename (no extension) | auto-generated |
 | `--db` | Path to local SteamSpy catalog | `steamspy_catalog.json` |
 
 ```bash
-# MVP test: Action games from Brazil and US (December 2025), 2 games
-python3 steam_extractor.py --tags Action --countries BR US \
-    --start 01/12/2025 --end 31/12/2025 \
-    --max-games 2 --api-key YOUR_KEY
+# Set API key once in the environment (keeps it out of shell history):
+export STEAM_API_KEY=YOUR_KEY
 
-# Larger run: FPS games with at least 10,000 reviews (2024)
-python3 steam_extractor.py --tags Action FPS --countries BR US \
+# MVP test: Action games from Brazil and US (December 2025), 2 games
+steam-extractor --tags Action --countries BR US \
+    --start 01/12/2025 --end 31/12/2025 --max-games 2
+
+# Larger run: FPS games with at least 10,000 reviews (2024), 2 passes
+steam-extractor --tags Action FPS --countries BR US \
     --start 01/01/2024 --end 31/12/2024 \
-    --max-games 10 --min-reviews 10000 --api-key YOUR_KEY
+    --max-games 10 --min-reviews 10000 --passes 2 --game-delay 30
 
 # Explicit app IDs, skip catalog lookup
-python3 steam_extractor.py --appids 730 1091500 1245620 \
-    --countries BR --start 01/01/2024 --end 31/12/2024 \
-    --api-key YOUR_KEY
+steam-extractor --appids 730 1091500 1245620 \
+    --countries BR --start 01/01/2024 --end 31/12/2024
 ```
 
-## Output Schema (`steam_extractor.py`)
+## Output Schema (`steam-extractor`)
 
 | Column | Description |
 |--------|-------------|
@@ -138,10 +143,14 @@ python3 steam_extractor.py --appids 730 1091500 1245620 \
 
 ```
 steam-extractor/
-├── steam_extractor.py          # Main pipeline: tags → reviews → country enrichment
-├── steam_reviews_fetcher.py    # Low-level review fetcher (single game)
-├── steamspy_catalog_fetcher.py # SteamSpy catalog builder
+├── src/
+│   └── steam_extractor/
+│       ├── __init__.py
+│       ├── tag_extractor.py        # Full pipeline: tags → reviews → country enrichment
+│       ├── reviews_fetcher.py      # Low-level review fetcher (single game)
+│       └── catalog_fetcher.py      # SteamSpy catalog builder
+├── pyproject.toml
 ├── requirements.txt
 ├── LICENSE
-└── logs/                       # Auto-created; log files written here
+└── logs/                           # Auto-created; log files written here
 ```
