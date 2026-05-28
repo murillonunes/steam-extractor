@@ -51,31 +51,42 @@ def timestamp_to_ddmmyyyy(timestamp: int | str | None) -> str | None:
     except (ValueError, TypeError, OSError):
         return None
 
-def fetch_reviews_by_date_range(
-        appid: str,
-        language: str,
-        start_date: date,
-        end_date: date,
-        max_reviews: int = 2000000
-    ) -> List[dict]:
+def _paginate_once(
+    appid: str,
+    language: str,
+    start_date: date,
+    end_date: date,
+    max_reviews: int,
+    pass_label: str = "Pass 1",
+) -> tuple[list[dict], bool]:
     """
-    Fetch reviews with pagination and early stop based on date range.
+    Single cursor-based pagination pass (filter=recent, newest → oldest).
+
+    Returns (collected_reviews, gap_detected).
+    gap_detected=True means at least one between-page date jump exceeded 5× the
+    running average days-per-page, which is the fingerprint of cursor drift:
+    new reviews were inserted mid-scrape, shifting cursor positions and causing
+    one or more pages to be silently skipped.
 
     Retry logic:
     - Connection errors (refused, timeout): wait 60s before retrying
     - Other errors (JSON parse, API error): exponential backoff
     - Max 10 retries per page before giving up
     """
-    cursor           = "*"
-    collected_reviews = []
-    num_per_page     = 100
-    seen_cursors     = set()
-    max_retries      = 10
-    last_progress    = 0
+    cursor = "*"
+    collected: list[dict] = []
+    num_per_page = 100
+    seen_cursors: set[str] = set()
+    max_retries = 10
 
-    log.info("Fetching reviews with early date filtering...")
+    prev_page_oldest: date | None = None
+    total_days_covered: int = 0
+    total_pages: int = 0
+    gap_detected = False
 
-    while len(collected_reviews) < max_reviews:
+    log.info(f"[{pass_label}] Starting pagination (filter=recent, newest → oldest)...")
+
+    while len(collected) < max_reviews:
         page_reviews = None
 
         for attempt in range(max_retries):
@@ -96,12 +107,10 @@ def fetch_reviews_by_date_range(
                     timeout=30
                 )
 
-                # Decode with utf-8-sig to handle BOM responses
                 text = response.content.decode("utf-8-sig").strip()
 
-                # Guard against HTML error pages
                 if not text.startswith("{"):
-                    raise ValueError(f"Non-JSON response (possible rate limit page): {text[:80]}")
+                    raise ValueError(f"Non-JSON response (possible rate limit): {text[:80]}")
 
                 data = json.loads(text)
 
@@ -114,73 +123,142 @@ def fetch_reviews_by_date_range(
 
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as e:
-                # Connection-level error: Steam likely rate-limited us
-                wait_time = 60
-                log.warning(f"Retry {attempt + 1}/{max_retries}: Connection error — waiting {wait_time}s: {e}")
-                time.sleep(wait_time)
+                log.warning(f"[{pass_label}] Retry {attempt+1}/{max_retries}: connection error, waiting 60s: {e}")
+                time.sleep(60)
 
             except Exception as e:
-                # Other errors: exponential backoff
                 wait_time = min(2 ** attempt, 60)
-                log.warning(f"Retry {attempt + 1}/{max_retries}: {e} (wait {wait_time}s)")
+                log.warning(f"[{pass_label}] Retry {attempt+1}/{max_retries}: {e} (wait {wait_time}s)")
                 time.sleep(wait_time)
 
         else:
-            log.error("Max retries exceeded. Stopping pagination.")
+            log.error(f"[{pass_label}] Max retries exceeded. Stopping.")
             break
 
         if not page_reviews:
-            log.info("No more reviews.")
+            if prev_page_oldest is not None and prev_page_oldest > start_date:
+                days_short = (prev_page_oldest - start_date).days
+                log.warning(
+                    f"[{pass_label}] API returned no more reviews at "
+                    f"{prev_page_oldest.strftime('%d/%m/%Y')} — {days_short} day(s) short of "
+                    f"start_date ({start_date.strftime('%d/%m/%Y')}). "
+                    f"Likely session throttling — result is incomplete for this pass."
+                )
+                gap_detected = True
+            else:
+                log.info(f"[{pass_label}] No more reviews.")
             break
 
-        page_has_in_range          = False
-        page_has_older_than_start  = False
+        page_has_in_range = False
+        page_has_older_than_start = False
+        page_dates: list[date] = []
 
-        # Date of oldest review on this page (for progress feedback)
-        page_dates = []
         for review in page_reviews:
             ts = review.get("timestamp_created")
             if ts is None:
                 continue
-
             review_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
             page_dates.append(review_date)
-
             if start_date <= review_date <= end_date:
-                collected_reviews.append(review)
+                collected.append(review)
                 page_has_in_range = True
             elif review_date < start_date:
                 page_has_older_than_start = True
 
-        oldest_on_page = min(page_dates).strftime("%d/%m/%Y") if page_dates else "?"
-        newest_on_page = max(page_dates).strftime("%d/%m/%Y") if page_dates else "?"
-        log.info(f"Page: {len(page_reviews)} reviews [{newest_on_page} -> {oldest_on_page}] | in range: {len(collected_reviews):,}")
+        if page_dates:
+            page_oldest = min(page_dates)
+            page_newest = max(page_dates)
+            page_span   = max((page_newest - page_oldest).days, 0)
 
-        milestone = (len(collected_reviews) // 100) * 100
-        if milestone > last_progress:
-            last_progress = milestone
+            # Cursor-drift detection: compare this page's newest date with the
+            # previous page's oldest date. Under normal pagination they should
+            # be consecutive; a large jump means pages were skipped.
+            if prev_page_oldest is not None:
+                jump_days = (prev_page_oldest - page_newest).days
+                avg_days_per_page = total_days_covered / total_pages if total_pages > 0 else 1
+                drift_threshold = max(avg_days_per_page * 5, 1)
+                if jump_days > drift_threshold:
+                    log.warning(
+                        f"[{pass_label}] Cursor drift detected: {jump_days:.0f}-day gap between pages "
+                        f"(expected ≤{drift_threshold:.0f} d based on avg {avg_days_per_page:.1f} d/page). "
+                        f"Reviews in this window may be missing — consider --passes 3."
+                    )
+                    gap_detected = True
+
+            total_days_covered += page_span
+            total_pages += 1
+            prev_page_oldest = page_oldest
+
+            log.info(
+                f"[{pass_label}] Page {total_pages}: {len(page_reviews)} reviews "
+                f"[{page_newest.strftime('%d/%m/%Y')} → {page_oldest.strftime('%d/%m/%Y')}] "
+                f"| in range: {len(collected):,}"
+            )
 
         if page_has_older_than_start and not page_has_in_range:
-            log.info("Reached reviews older than start_date. Stopping early.")
+            log.info(f"[{pass_label}] All reviews on this page are before start_date. Stopping.")
             break
 
         cursor = next_cursor
         if cursor in seen_cursors:
-            log.warning("Cursor loop detected. Stopping pagination.")
+            log.warning(f"[{pass_label}] Cursor loop detected. Stopping.")
             break
-
         seen_cursors.add(cursor)
         time.sleep(0.5)
 
-    # Deduplicate by unique review ID in case Steam returned the same review
-    # multiple times across pages (can happen with filter=recent)
-    before = len(collected_reviews)
-    collected_reviews = list({r["recommendationid"]: r for r in collected_reviews}.values())
-    dupes = before - len(collected_reviews)
-    if dupes:
-        log.info(f"Removed {dupes} duplicate reviews (recommendationid)")
+    log.info(f"[{pass_label}] Done: {len(collected):,} reviews, gap_detected={gap_detected}")
+    return collected, gap_detected
 
-    return collected_reviews
+
+def fetch_reviews_by_date_range(
+    appid: str,
+    language: str,
+    start_date: date,
+    end_date: date,
+    max_reviews: int = 2_000_000,
+    passes: int = 1,
+) -> list[dict]:
+    """
+    Fetch reviews with multi-pass deduplication to recover reviews missed by cursor drift.
+
+    Steam's filter=recent paginates a live stream. When new reviews are posted while
+    scraping, cursor positions shift and entire pages get silently skipped — this is
+    why identical runs can yield wildly different counts (e.g., 11k vs 64k).
+
+    Running multiple passes and merging via recommendationid deduplication recovers
+    the skipped reviews, since drift shifts differently in each independent pass.
+
+    passes=1  : single pass, original behaviour (fast but potentially incomplete)
+    passes=3+ : recommended for high-volume games or when consistent counts matter
+    """
+    merged: dict[str, dict] = {}  # recommendationid → review
+
+    for i in range(passes):
+        label = f"Pass {i+1}/{passes}"
+        pass_reviews, gap_detected = _paginate_once(
+            appid, language, start_date, end_date, max_reviews, pass_label=label
+        )
+
+        prev_count  = len(merged)
+        for r in pass_reviews:
+            merged[r["recommendationid"]] = r
+        new_unique = len(merged) - prev_count
+
+        log.info(
+            f"[{label}] Merged: {len(pass_reviews):,} reviews this pass, "
+            f"{new_unique:,} new unique (running total: {len(merged):,})"
+        )
+
+        if i < passes - 1:
+            if gap_detected:
+                log.info(f"[{label}] Drift detected — running next pass to recover missing reviews.")
+            else:
+                log.info(f"[{label}] No drift detected — stopping early at pass {i+1}.")
+                break
+
+    result = list(merged.values())
+    log.info(f"All passes complete: {len(result):,} unique reviews")
+    return result
 
 def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
     processed_reviews = []
@@ -231,6 +309,14 @@ Examples:
     parser.add_argument("start_date", help="Start date (dd/mm/yyyy)")
     parser.add_argument("end_date",   help="End date (dd/mm/yyyy)")
     parser.add_argument("--format", "-f", choices=["json", "csv"], default="json")
+    parser.add_argument(
+        "--passes", "-p", type=int, default=1, metavar="N",
+        help=(
+            "Number of independent collection passes (default: 1). "
+            "Each pass restarts from cursor=* and results are merged via deduplication. "
+            "Use 3+ for high-volume games to compensate for cursor drift."
+        )
+    )
 
     args = parser.parse_args()
     steam_lang = map_language(args.language)
@@ -251,7 +337,7 @@ Examples:
 
     try:
         reviews = fetch_reviews_by_date_range(
-            args.appid, steam_lang, start_date, end_date
+            args.appid, steam_lang, start_date, end_date, passes=args.passes
         )
 
         log.info(f"Pagination complete! {len(reviews):,} reviews collected")

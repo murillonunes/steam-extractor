@@ -142,20 +142,32 @@ def fetch_country_codes(user_ids: list[str], api_key: str) -> dict[str, str]:
     log.info(f"Fetching player profiles: {len(user_ids):,} users in {len(batches)} batches")
 
     for i, batch in enumerate(batches, start=1):
-        try:
-            r = requests.get(
-                PLAYER_SUMMARY_URL,
-                params={"key": api_key, "steamids": ",".join(batch)},
-                timeout=30
-            )
-            r.raise_for_status()
-            players = r.json().get("response", {}).get("players", [])
-            for player in players:
-                steamid = player.get("steamid", "")
-                country = player.get("loccountrycode", "")
-                country_map[steamid] = country.upper() if country else ""
-        except Exception as e:
-            print(f"[Steam] Error in batch {i}: {e}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(
+                    PLAYER_SUMMARY_URL,
+                    params={"key": api_key, "steamids": ",".join(batch)},
+                    timeout=30
+                )
+                r.raise_for_status()
+                players = r.json().get("response", {}).get("players", [])
+                for player in players:
+                    steamid = player.get("steamid", "")
+                    country = player.get("loccountrycode", "")
+                    country_map[steamid] = country.upper() if country else ""
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    wait = 30 * (attempt + 1)
+                    log.warning(f"Rate limited on batch {i} (attempt {attempt+1}/{max_retries}), waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    log.warning(f"Error in batch {i}: {e}")
+                    break
+            except Exception as e:
+                log.warning(f"Error in batch {i}: {e}")
+                break
 
         if i % 10 == 0:
             log.info(f"Profile batch {i}/{len(batches)} done")
@@ -164,8 +176,8 @@ def fetch_country_codes(user_ids: list[str], api_key: str) -> dict[str, str]:
 
     filled = sum(1 for v in country_map.values() if v)
     total  = len(user_ids)
-    print(f"[Steam] country_code found for {filled:,} / {total:,} users "
-          f"({filled/total*100:.1f}% )") if total else None
+    if total:
+        log.info(f"country_code found for {filled:,} / {total:,} users ({filled/total*100:.1f}%)")
 
     return country_map
 
@@ -184,6 +196,8 @@ def extract_reviews_by_tags(
     max_games_per_tag: int = 10,
     min_reviews: int = 0,
     appids: list[str] | None = None,
+    passes: int = 1,
+    game_delay: float = GAME_DELAY,
 ) -> pd.DataFrame:
     """
     Full pipeline:
@@ -244,7 +258,7 @@ def extract_reviews_by_tags(
         log.info(f"  [{i}/{len(games_list)}] {name} (appid: {appid})" + (" [already collected]" if already_seen else ""))
 
         if already_seen:
-            time.sleep(GAME_DELAY)
+            time.sleep(game_delay)
             continue
 
         reviews = fetch_reviews_by_date_range(
@@ -252,6 +266,7 @@ def extract_reviews_by_tags(
             language="all",
             start_date=start_date,
             end_date=end_date,
+            passes=passes,
         )
 
         for r in reviews:
@@ -274,7 +289,7 @@ def extract_reviews_by_tags(
             })
 
         log.info(f"  → {len(reviews)} reviews collected")
-        time.sleep(GAME_DELAY)
+        time.sleep(game_delay)
 
     if not all_rows:
         log.warning("No reviews collected. Check tags and date range.")
@@ -373,6 +388,13 @@ Examples:
                         help="Output format (default: csv)")
     parser.add_argument("--output",      default=None,
                         help="Output filename without extension (auto-generated if omitted)")
+    parser.add_argument("--passes",      type=int, default=1, metavar="N",
+                        help="Collection passes per game merged via deduplication (default: 1). "
+                             "Use 3+ to recover reviews missed by cursor drift.")
+    parser.add_argument("--game-delay",  type=float, default=GAME_DELAY, metavar="S",
+                        help=f"Seconds to wait between games (default: {GAME_DELAY}). "
+                             "Increase to reduce session throttling when processing "
+                             "multiple high-volume games.")
 
     args = parser.parse_args()
 
@@ -407,6 +429,8 @@ Examples:
         max_games_per_tag=args.max_games,
         min_reviews=args.min_reviews,
         appids=args.appids,
+        passes=args.passes,
+        game_delay=args.game_delay,
     )
 
     if args.output:
