@@ -4,13 +4,15 @@ Steam Reviews Fetcher - Extracts game reviews from Steam.
 """
 
 import argparse
-import logging
-import requests
 import json
+import logging
 import time
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from typing import Dict, List
+
 import pandas as pd
-from datetime import datetime, date, timezone
-from typing import List, Dict
+import requests
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,21 @@ LANGUAGE_MAP = {
 }
 
 BASE_URL = "https://store.steampowered.com/appreviews/"
+
+
+@dataclass
+class PaginationResult:
+    """Outcome and diagnostics for one cursor-based pagination pass."""
+
+    reviews: list[dict]
+    complete: bool
+    reason: str
+    pages: int
+    scanned_reviews: int
+    expected_reviews: int | None
+    oldest_date: date | None
+    drift_detected: bool
+
 
 def map_language(user_lang: str) -> str:
     user_lang = user_lang.lower().strip()
@@ -58,12 +75,12 @@ def _paginate_once(
     end_date: date,
     max_reviews: int,
     pass_label: str = "Pass 1",
-) -> tuple[list[dict], bool]:
+) -> PaginationResult:
     """
     Single cursor-based pagination pass (filter=recent, newest → oldest).
 
-    Returns (collected_reviews, gap_detected).
-    gap_detected=True means at least one between-page date jump exceeded 5× the
+    Returns reviews together with completeness diagnostics. drift_detected=True
+    means at least one between-page date jump exceeded 5× the
     running average days-per-page, which is the fingerprint of cursor drift:
     new reviews were inserted mid-scrape, shifting cursor positions and causing
     one or more pages to be silently skipped.
@@ -83,6 +100,11 @@ def _paginate_once(
     total_days_covered: int = 0
     total_pages: int = 0
     gap_detected = False
+    scanned_ids: set[str] = set()
+    expected_reviews: int | None = None
+    last_page_size: int | None = None
+    complete = False
+    reason = "unknown"
 
     log.info(f"[{pass_label}] Starting pagination (filter=recent, newest → oldest)...")
 
@@ -117,6 +139,13 @@ def _paginate_once(
                 if data.get("success") != 1:
                     raise ValueError(f"API error: {data}")
 
+                if expected_reviews is None:
+                    reported_total = data.get("query_summary", {}).get("total_reviews")
+                    try:
+                        expected_reviews = int(reported_total)
+                    except (TypeError, ValueError):
+                        expected_reviews = None
+
                 page_reviews = data.get("reviews", [])
                 next_cursor  = data.get("cursor", "*")
                 break
@@ -133,27 +162,60 @@ def _paginate_once(
 
         else:
             log.error(f"[{pass_label}] Max retries exceeded. Stopping.")
+            reason = "max_retries_exceeded"
             break
 
         if not page_reviews:
-            if prev_page_oldest is not None and prev_page_oldest > start_date:
-                days_short = (prev_page_oldest - start_date).days
-                log.warning(
-                    f"[{pass_label}] API returned no more reviews at "
-                    f"{prev_page_oldest.strftime('%d/%m/%Y')} — {days_short} day(s) short of "
-                    f"start_date ({start_date.strftime('%d/%m/%Y')}). "
-                    f"Likely session throttling — result is incomplete for this pass."
+            reached_reported_total = (
+                expected_reviews is not None and len(scanned_ids) >= expected_reviews
+            )
+            ended_with_partial_page = (
+                expected_reviews is None
+                and last_page_size is not None
+                and last_page_size < num_per_page
+            )
+
+            if reached_reported_total or ended_with_partial_page:
+                complete = True
+                reason = "end_of_history"
+                date_note = (
+                    " The requested start_date predates the first available review."
+                    if prev_page_oldest is not None and prev_page_oldest > start_date
+                    else ""
                 )
-                gap_detected = True
+                log.info(
+                    f"[{pass_label}] Review history ended normally at "
+                    f"{prev_page_oldest.strftime('%d/%m/%Y') if prev_page_oldest else 'unknown date'}."
+                    f"{date_note}"
+                )
+            elif prev_page_oldest is not None and prev_page_oldest <= start_date:
+                complete = True
+                reason = "date_range_complete"
+                log.info(f"[{pass_label}] Requested date range is complete.")
             else:
-                log.info(f"[{pass_label}] No more reviews.")
+                reason = "premature_empty_response"
+                missing = (
+                    f"; scanned {len(scanned_ids):,} of approximately "
+                    f"{expected_reviews:,} reviews"
+                    if expected_reviews is not None
+                    else ""
+                )
+                log.warning(
+                    f"[{pass_label}] API returned an unexpected empty page before the "
+                    f"requested range was completed{missing}. Result is incomplete."
+                )
             break
+
+        last_page_size = len(page_reviews)
 
         page_has_in_range = False
         page_has_older_than_start = False
         page_dates: list[date] = []
 
         for review in page_reviews:
+            recommendation_id = review.get("recommendationid")
+            if recommendation_id is not None:
+                scanned_ids.add(str(recommendation_id))
             ts = review.get("timestamp_created")
             if ts is None:
                 continue
@@ -197,17 +259,36 @@ def _paginate_once(
 
         if page_has_older_than_start and not page_has_in_range:
             log.info(f"[{pass_label}] All reviews on this page are before start_date. Stopping.")
+            complete = True
+            reason = "start_date_reached"
             break
 
         cursor = next_cursor
         if cursor in seen_cursors:
             log.warning(f"[{pass_label}] Cursor loop detected. Stopping.")
+            reason = "cursor_loop"
             break
         seen_cursors.add(cursor)
         time.sleep(0.5)
 
-    log.info(f"[{pass_label}] Done: {len(collected):,} reviews, gap_detected={gap_detected}")
-    return collected, gap_detected
+    if reason == "unknown":
+        reason = "max_reviews_reached"
+
+    log.info(
+        f"[{pass_label}] Done: {len(collected):,} reviews, "
+        f"scanned={len(scanned_ids):,}, expected={expected_reviews}, "
+        f"complete={complete}, reason={reason}, drift_detected={gap_detected}"
+    )
+    return PaginationResult(
+        reviews=collected,
+        complete=complete,
+        reason=reason,
+        pages=total_pages,
+        scanned_reviews=len(scanned_ids),
+        expected_reviews=expected_reviews,
+        oldest_date=prev_page_oldest,
+        drift_detected=gap_detected,
+    )
 
 
 def fetch_reviews_by_date_range(
@@ -235,9 +316,10 @@ def fetch_reviews_by_date_range(
 
     for i in range(passes):
         label = f"Pass {i+1}/{passes}"
-        pass_reviews, gap_detected = _paginate_once(
+        pagination = _paginate_once(
             appid, language, start_date, end_date, max_reviews, pass_label=label
         )
+        pass_reviews = pagination.reviews
 
         prev_count  = len(merged)
         for r in pass_reviews:
@@ -250,8 +332,11 @@ def fetch_reviews_by_date_range(
         )
 
         if i < passes - 1:
-            if gap_detected:
-                log.info(f"[{label}] Drift detected — running next pass to recover missing reviews.")
+            if pagination.drift_detected or not pagination.complete:
+                log.info(
+                    f"[{label}] Incomplete pass or drift detected — running next pass "
+                    f"to recover missing reviews."
+                )
             else:
                 log.info(f"[{label}] No drift detected — stopping early at pass {i+1}.")
                 break
