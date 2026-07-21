@@ -23,6 +23,7 @@ This project is a Python package with three CLI tools that work together:
 - 📅 **Date range filtering** with early-stop pagination to avoid unnecessary requests
 - 🔁 **Multi-pass deduplication** — re-runs merged by `recommendationid` to recover reviews missed by cursor drift
 - 💾 **CSV / JSON output** via pandas
+- 🧾 **Research manifest** with query provenance, coverage and completeness diagnostics
 - 🗂️ **Incremental catalog saves** — SteamSpy fetcher resumes interrupted runs
 - 🕐 Timestamps converted to `dd/mm/yyyy` readable format
 
@@ -131,6 +132,7 @@ steam-extractor --appids 730 1091500 1245620 \
 |--------|-------------|
 | `app_id` | Steam app ID |
 | `app_name` | Game name |
+| `recommendation_id` | Unique Steam review ID used for auditing and deduplication |
 | `user_id` | Steam user ID (steamid64) |
 | `country_code` | ISO 3166-1 alpha-2 (e.g. `BR`, `US`) |
 | `language` | Review language |
@@ -138,6 +140,28 @@ steam-extractor --appids 730 1091500 1245620 \
 | `voted_up` | `True` / `False` |
 | `tag` | Tag combination used to find the game |
 | `date_created` | Review date (dd/mm/yyyy) |
+
+## Research Manifest
+
+Every extraction writes a JSON sidecar next to the dataset:
+
+```text
+reviews_action_br_01-01-2024_31-12-2024.csv
+reviews_action_br_01-01-2024_31-12-2024.metadata.json
+```
+
+The manifest records:
+
+- package version, Git commit and whether the working tree had uncommitted changes;
+- query parameters, Steam filters and requested collection passes;
+- SteamSpy catalog snapshot metadata;
+- per-game pages, expected/scanned reviews, reviews in range, completion reason and drift;
+- country-profile coverage, failed batches and rows retained by the country filter;
+- output filename, format and row count;
+- an aggregate `dataset_complete` flag.
+
+If a query returns no rows, no empty CSV/JSON is created, but the metadata sidecar is still
+written so the null result remains auditable.
 
 ## Project Structure
 

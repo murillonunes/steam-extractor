@@ -6,9 +6,14 @@ Steam Reviews Fetcher - Extracts game reviews from Steam.
 import argparse
 import json
 import logging
+import os
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
@@ -47,6 +52,99 @@ class PaginationResult:
     expected_reviews: int | None
     oldest_date: date | None
     drift_detected: bool
+
+    def to_metadata(self) -> dict:
+        return {
+            "complete": self.complete,
+            "reason": self.reason,
+            "pages": self.pages,
+            "scanned_reviews": self.scanned_reviews,
+            "expected_reviews": self.expected_reviews,
+            "reviews_in_date_range": len(self.reviews),
+            "oldest_review": self.oldest_date.isoformat() if self.oldest_date else None,
+            "drift_detected": self.drift_detected,
+        }
+
+
+@dataclass
+class ReviewFetchResult:
+    """Merged reviews and diagnostics from all pagination passes."""
+
+    reviews: list[dict]
+    passes: list[PaginationResult]
+
+    @property
+    def complete(self) -> bool:
+        return any(result.complete and not result.drift_detected for result in self.passes)
+
+    def to_metadata(self) -> dict:
+        last_pass = self.passes[-1] if self.passes else None
+        return {
+            "complete": self.complete,
+            "completion_reason": last_pass.reason if last_pass else "no_passes",
+            "passes_executed": len(self.passes),
+            "unique_reviews_in_date_range": len(self.reviews),
+            "drift_detected": any(result.drift_detected for result in self.passes),
+            "passes": [result.to_metadata() for result in self.passes],
+        }
+
+
+def software_metadata() -> dict:
+    """Returns best-effort package and source-control provenance."""
+    try:
+        package_version = version("steam-extractor")
+    except PackageNotFoundError:
+        package_version = "unknown"
+
+    repository_root = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        git_commit = result.stdout.strip() or None
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        git_dirty = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        git_commit = None
+        git_dirty = None
+
+    return {
+        "package_version": package_version,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+    }
+
+
+def save_manifest(filename: str, metadata: dict) -> str:
+    """Atomically writes a JSON metadata sidecar and returns its path."""
+    path = Path(f"{filename}.metadata.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as file:
+            temp_name = file.name
+            json.dump(metadata, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return str(path)
 
 
 def map_language(user_lang: str) -> str:
@@ -291,14 +389,14 @@ def _paginate_once(
     )
 
 
-def fetch_reviews_by_date_range(
+def fetch_reviews_with_metadata(
     appid: str,
     language: str,
     start_date: date,
     end_date: date,
     max_reviews: int = 2_000_000,
     passes: int = 1,
-) -> list[dict]:
+) -> ReviewFetchResult:
     """
     Fetch reviews with multi-pass deduplication to recover reviews missed by cursor drift.
 
@@ -313,12 +411,14 @@ def fetch_reviews_by_date_range(
     passes=3+ : recommended for high-volume games or when consistent counts matter
     """
     merged: dict[str, dict] = {}  # recommendationid → review
+    pass_results: list[PaginationResult] = []
 
     for i in range(passes):
         label = f"Pass {i+1}/{passes}"
         pagination = _paginate_once(
             appid, language, start_date, end_date, max_reviews, pass_label=label
         )
+        pass_results.append(pagination)
         pass_reviews = pagination.reviews
 
         prev_count  = len(merged)
@@ -343,9 +443,34 @@ def fetch_reviews_by_date_range(
 
     result = list(merged.values())
     log.info(f"All passes complete: {len(result):,} unique reviews")
-    return result
+    return ReviewFetchResult(reviews=result, passes=pass_results)
 
-def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
+
+def fetch_reviews_by_date_range(
+    appid: str,
+    language: str,
+    start_date: date,
+    end_date: date,
+    max_reviews: int = 2_000_000,
+    passes: int = 1,
+) -> list[dict]:
+    """Backward-compatible wrapper returning only the merged reviews."""
+    return fetch_reviews_with_metadata(
+        appid=appid,
+        language=language,
+        start_date=start_date,
+        end_date=end_date,
+        max_reviews=max_reviews,
+        passes=passes,
+    ).reviews
+
+
+def save_reviews(
+    reviews: List[Dict],
+    filename: str,
+    format_type: str = 'json',
+    metadata: dict | None = None,
+):
     processed_reviews = []
     for r in reviews:
         processed = r.copy()
@@ -366,6 +491,10 @@ def save_reviews(reviews: List[Dict], filename: str, format_type: str = 'json'):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(processed_reviews, f, ensure_ascii=False, indent=2)
         log.info(f"Saved JSON: {output_file} ({len(processed_reviews)} reviews)")
+
+    if metadata is not None:
+        manifest_file = save_manifest(filename, metadata)
+        log.info(f"Saved metadata: {manifest_file}")
 
 def filter_reviews_by_date(reviews: List[Dict], start_date: date, end_date: date) -> List[Dict]:
     filtered = []
@@ -421,20 +550,45 @@ Examples:
     log.info(f"Date range: {args.start_date} to {args.end_date}")
 
     try:
-        reviews = fetch_reviews_by_date_range(
+        extraction = fetch_reviews_with_metadata(
             args.appid, steam_lang, start_date, end_date, passes=args.passes
         )
+        reviews = extraction.reviews
 
         log.info(f"Pagination complete! {len(reviews):,} reviews collected")
 
+        safe_start  = args.start_date.replace("/", "-")
+        safe_end    = args.end_date.replace("/", "-")
+        output_name = f"reviews_{args.appid}_{steam_lang}_{safe_start}_{safe_end}"
+        metadata = {
+            "schema_version": 1,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "software": software_metadata(),
+            "query": {
+                "appid": str(args.appid),
+                "language": steam_lang,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "passes_requested": args.passes,
+                "steam_filter": "recent",
+                "offtopic_included": False,
+            },
+            "pagination": extraction.to_metadata(),
+            "output": {
+                "rows": len(reviews),
+                "format": args.format,
+                "file": f"{output_name}.{args.format}" if reviews else None,
+            },
+            "dataset_complete": extraction.complete,
+        }
+
         if reviews:
-            safe_start  = args.start_date.replace("/", "-")
-            safe_end    = args.end_date.replace("/", "-")
-            output_name = f"reviews_{args.appid}_{steam_lang}_{safe_start}_{safe_end}"
-            save_reviews(reviews, output_name, args.format)
+            save_reviews(reviews, output_name, args.format, metadata=metadata)
             log.info(f"Complete! {len(reviews):,} reviews saved")
         else:
             log.info("No reviews found in date range.")
+            manifest_file = save_manifest(output_name, metadata)
+            log.info(f"Saved metadata: {manifest_file}")
 
     except Exception as e:
         log.error(f"Fetch error: {e}")
