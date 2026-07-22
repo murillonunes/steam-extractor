@@ -155,6 +155,73 @@ class ReviewStoreTests(unittest.TestCase):
 class SyncResumeTests(unittest.TestCase):
     @patch("steam_extractor.reviews_sync.time.sleep")
     @patch("steam_extractor.reviews_sync._request_page")
+    def test_ctrl_c_marks_checkpoint_paused_and_allows_resume(self, request_page, _sleep):
+        request_page.side_effect = [
+            {
+                "success": 1,
+                "cursor": "cursor-2",
+                "query_summary": {"total_reviews": 1},
+                "reviews": [review("1")],
+            },
+            KeyboardInterrupt(),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                interrupted = sync_filter(
+                    store,
+                    app_id="730",
+                    language="all",
+                    filter_type="recent",
+                )
+                job = store.get_job("730", "all", "recent")
+
+                self.assertEqual(interrupted.status, "paused")
+                self.assertEqual(interrupted.reason, "user_interrupted")
+                self.assertEqual(job["status"], "paused")
+                self.assertEqual(job["cursor"], "cursor-2")
+
+                request_page.reset_mock()
+                request_page.side_effect = None
+                request_page.return_value = {
+                    "success": 1,
+                    "cursor": "cursor-2",
+                    "reviews": [],
+                }
+                resumed = sync_filter(
+                    store,
+                    app_id="730",
+                    language="all",
+                    filter_type="recent",
+                    resume=True,
+                )
+
+        self.assertTrue(resumed.resumed)
+        self.assertEqual(resumed.status, "complete")
+        self.assertEqual(request_page.call_args.args[3], "cursor-2")
+
+    def test_ctrl_c_rolls_back_active_page_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                store.start_run("run-1", "730", "all", "recent")
+                with self.assertRaises(KeyboardInterrupt):
+                    with store.transaction() as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO reviews(
+                                recommendation_id, app_id, timestamp_created,
+                                content_hash, current_version, first_seen_at, last_seen_at
+                            ) VALUES ('partial', '730', 1, 'hash', 1, 'now', 'now')
+                            """
+                        )
+                        raise KeyboardInterrupt
+
+                self.assertFalse(store.has_review("partial"))
+
+    @patch("steam_extractor.reviews_sync.time.sleep")
+    @patch("steam_extractor.reviews_sync._request_page")
     def test_empty_page_with_large_deficit_is_incomplete(self, request_page, _sleep):
         request_page.side_effect = [
             {

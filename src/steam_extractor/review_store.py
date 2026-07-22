@@ -82,7 +82,7 @@ class ReviewStore:
             self.connection.execute("BEGIN")
             yield self.connection
             self.connection.commit()
-        except Exception:
+        except BaseException:
             self.connection.rollback()
             raise
 

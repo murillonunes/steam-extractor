@@ -242,6 +242,9 @@ def sync_filter(
             seen_cursors.add(next_cursor)
             cursor = next_cursor
             time.sleep(0.5)
+    except KeyboardInterrupt:
+        status, reason = "paused", "user_interrupted"
+        log.warning("Synchronization interrupted by user; checkpoint preserved for --resume")
     except Exception:
         status, reason = "failed", "request_error"
         store.finish_run(
@@ -424,6 +427,9 @@ def main() -> int:
         sync_updates=not args.no_sync_updates,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    phases = (result["recent"], result["reconciliation"], result["updated"])
+    if any(phase and phase["reason"] == "user_interrupted" for phase in phases):
+        return 130
     return 0
 
 

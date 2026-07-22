@@ -171,6 +171,10 @@ Useful limits:
 | `--overlap-pages N` | Known consecutive pages required before incremental stop |
 | `--no-sync-updates` | Skip the separate check for recently edited reviews |
 
+Pressing `Ctrl+C` rolls back an unfinished page, marks the synchronization as
+`paused` with reason `user_interrupted`, and preserves the last committed cursor.
+Run the same command with `--resume` to continue from that checkpoint.
+
 Once the database contains verified coverage for a requested interval, the country/tag
 pipeline can reuse it without downloading the reviews again:
 
