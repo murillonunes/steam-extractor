@@ -12,6 +12,7 @@ from steam_extractor.reviews_fetcher import (
     ReviewFetchResult,
     save_manifest,
 )
+from steam_extractor.review_store import ReviewStore
 from steam_extractor.tag_extractor import (
     CountryFetchResult,
     extract_reviews_by_tags,
@@ -116,6 +117,84 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(metadata["games"][0]["passes"][0]["scanned_reviews"], 1)
         self.assertEqual(metadata["country_enrichment"]["reviews_before_filter"], 1)
         self.assertEqual(metadata["country_enrichment"]["reviews_matching_filter"], 1)
+
+    @patch("steam_extractor.tag_extractor.software_metadata", return_value={"test": True})
+    @patch("steam_extractor.tag_extractor.fetch_country_codes_with_metadata")
+    @patch("steam_extractor.tag_extractor.fetch_reviews_with_metadata")
+    def test_pipeline_reuses_verified_sqlite_coverage(
+        self, fetch_reviews, fetch_countries, _software
+    ):
+        fetch_reviews.side_effect = AssertionError("Steam fallback should not run")
+        fetch_countries.return_value = CountryFetchResult(
+            country_map={"765": "BR"},
+            requested_users=1,
+            returned_profiles=1,
+            country_available=1,
+            failed_batches=0,
+            failed_users=0,
+        )
+        cached_review = {
+            "recommendationid": "42",
+            "author": {"steamid": "765"},
+            "timestamp_created": 1711584000,
+            "timestamp_updated": 1711584000,
+            "language": "brazilian",
+            "review": "Ótimo",
+            "voted_up": True,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(database) as store:
+                store.start_run("seed", "2076580", "all", "recent")
+                store.save_page(
+                    run_id="seed",
+                    app_id="2076580",
+                    language="all",
+                    filter_type="recent",
+                    reviews=[cached_review],
+                    next_cursor="end",
+                    expected_reviews=1,
+                    page_number=1,
+                    total_received=1,
+                )
+                store.finish_run(
+                    "seed",
+                    "2076580",
+                    "all",
+                    "recent",
+                    status="complete",
+                    reason="end_of_history",
+                    complete_history=True,
+                    verified_coverage=True,
+                )
+            catalog = Path(temp_dir) / "catalog.json"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "metadata": {"downloaded_at": "2026-01-01"},
+                        "games": {"2076580": {"name": "Pepper Grinder", "tags": {"Action": 1}}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            frame = extract_reviews_by_tags(
+                tags=["Action"],
+                countries=["BR"],
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 12, 31),
+                api_key="key",
+                db_path=str(catalog),
+                appids=["2076580"],
+                game_delay=0,
+                review_database=database,
+            )
+
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.iloc[0]["review_version"], 1)
+        self.assertEqual(len(frame.iloc[0]["review_content_hash"]), 64)
+        self.assertEqual(frame.attrs["extraction_metadata"]["games"][0]["source"], "sqlite_cache")
+        fetch_reviews.assert_not_called()
 
 
 if __name__ == "__main__":

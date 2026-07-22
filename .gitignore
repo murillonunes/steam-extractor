@@ -35,5 +35,8 @@ logs/
 # Generated data / outputs
 *.json
 *.csv
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 data/
 output/

@@ -13,6 +13,7 @@ This project is a Python package with three CLI tools that work together:
 |---------|-------------|
 | `steamspy-catalog` | Builds a local SteamSpy catalog with tags for all games (run once) |
 | `steam-reviews` | Extracts reviews for a single game by appid, language and date range |
+| `steam-reviews-sync` | Incrementally archives and versions reviews in local SQLite |
 | `steam-extractor` | Full pipeline: discovers games by tag, collects reviews, enriches with country |
 
 ## Features
@@ -24,6 +25,7 @@ This project is a Python package with three CLI tools that work together:
 - 🔁 **Multi-pass deduplication** — re-runs merged by `recommendationid` to recover reviews missed by cursor drift
 - 💾 **CSV / JSON output** via pandas
 - 🧾 **Research manifest** with query provenance, coverage and completeness diagnostics
+- 🗄️ **Incremental SQLite archive** with checkpoints, resume, deduplication and versions
 - 🗂️ **Incremental catalog saves** — SteamSpy fetcher resumes interrupted runs
 - 🕐 Timestamps converted to `dd/mm/yyyy` readable format
 
@@ -107,6 +109,8 @@ The API key can also be provided via the `STEAM_API_KEY` environment variable in
 | `--format` | `csv` or `json` | `csv` |
 | `--output` | Output filename (no extension) | auto-generated |
 | `--db` | Path to local SteamSpy catalog | `steamspy_catalog.json` |
+| `--review-db` | Optional SQLite archive reused when interval coverage is complete | — |
+| `--allow-unverified-cache` | Reuse resumed cursor coverage, marking the dataset incomplete | disabled |
 
 ```bash
 # Set API key once in the environment (keeps it out of shell history):
@@ -126,6 +130,65 @@ steam-extractor --appids 730 1091500 1245620 \
     --countries BR --start 01/01/2024 --end 31/12/2024
 ```
 
+### Incremental archive for high-volume games
+
+SQLite is embedded: no database server or continuously running process is required. Each
+CLI invocation opens the file, commits pages transactionally and closes it on exit.
+
+```bash
+# Archive reviews down to the beginning of 2024, pausing after 30 minutes if necessary
+steam-reviews-sync 730 --language all --start 01/01/2024 \
+    --database steam_reviews.sqlite --max-runtime 1800
+
+# Continue a paused/failed cursor checkpoint
+steam-reviews-sync 730 --language all --start 01/01/2024 \
+    --database steam_reviews.sqlite --max-runtime 1800 --resume
+```
+
+Each page and its next cursor are committed in the same SQLite transaction. A repeated
+`recommendationid` is not duplicated. When mutable review content changes, the current row
+is updated and the observed version is appended to `review_versions`.
+
+An empty API page is not sufficient to declare the entire history complete. The synchronizer
+also compares the cumulative number of reviews received with Steam's `total_reviews`, allowing
+only a small tolerance for live-stream drift. If the API stream ends with a material deficit,
+the run is marked `incomplete` with reason `api_exhausted_before_expected_total`; reviews and
+verified temporal bounds already collected remain available in SQLite.
+
+On later non-resume runs, synchronization starts at the live head and stops after three
+fully known pages by default. The `updated` ordering is also checked after an existing
+archive is present. A resumed cursor is followed by a head reconciliation because Steam's
+review stream is live; resumed coverage remains conservative when continuity cannot be
+proven.
+
+Useful limits:
+
+| Argument | Description |
+|----------|-------------|
+| `--max-pages N` | Pause after N pages in this invocation |
+| `--max-runtime SECONDS` | Pause after the requested wall-clock duration |
+| `--resume` | Continue a paused or failed checkpoint |
+| `--overlap-pages N` | Known consecutive pages required before incremental stop |
+| `--no-sync-updates` | Skip the separate check for recently edited reviews |
+
+Once the database contains verified coverage for a requested interval, the country/tag
+pipeline can reuse it without downloading the reviews again:
+
+```bash
+steam-extractor --tags Action --appids 730 --countries BR US \
+    --start 01/01/2024 --end 31/12/2024 \
+    --review-db steam_reviews.sqlite --output cs2_2024_br_us
+```
+
+If verified local coverage is unavailable, `steam-extractor` logs that fact and falls back
+to the Steam API. The research manifest records whether each game came from `sqlite_cache`
+or `steam_api`.
+
+A cursor resumed across separate processes cannot prove that the live Steam stream did not
+shift at the boundary. Such data remains stored but is not reused by default. For exploratory
+work, `--allow-unverified-cache` permits reuse while forcing `dataset_complete: false` in the
+manifest; confirmatory research should retain the conservative default.
+
 ## Output Schema (`steam-extractor`)
 
 | Column | Description |
@@ -133,6 +196,8 @@ steam-extractor --appids 730 1091500 1245620 \
 | `app_id` | Steam app ID |
 | `app_name` | Game name |
 | `recommendation_id` | Unique Steam review ID used for auditing and deduplication |
+| `review_version` | Observed archive version (`1` for a newly observed live review) |
+| `review_content_hash` | SHA-256 of research-relevant mutable review fields |
 | `user_id` | Steam user ID (steamid64) |
 | `country_code` | ISO 3166-1 alpha-2 (e.g. `BR`, `US`) |
 | `language` | Review language |

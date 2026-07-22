@@ -33,6 +33,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from steam_extractor.review_store import ReviewStore, review_content_hash
 from steam_extractor.reviews_fetcher import (
     fetch_reviews_with_metadata,
     parse_date,
@@ -260,6 +261,8 @@ def extract_reviews_by_tags(
     appids: list[str] | None = None,
     passes: int = 1,
     game_delay: float = GAME_DELAY,
+    review_database: str | None = None,
+    allow_unverified_cache: bool = False,
 ) -> pd.DataFrame:
     """
     Full pipeline:
@@ -270,8 +273,8 @@ def extract_reviews_by_tags(
         5. Return structured DataFrame
 
     Output columns:
-        app_id, app_name, recommendation_id, user_id, country_code, language,
-        review_text, voted_up, tag, date_created
+        app_id, app_name, recommendation_id, review_version, review_content_hash,
+        user_id, country_code, language, review_text, voted_up, tag, date_created
     """
     catalog, catalog_metadata = load_catalog_with_metadata(db_path)
     all_rows        = []
@@ -303,6 +306,8 @@ def extract_reviews_by_tags(
                 "min_reviews": min_reviews,
                 "steam_filter": "recent",
                 "offtopic_included": False,
+                "review_database": review_database,
+                "allow_unverified_cache": allow_unverified_cache,
             },
             "catalog": {**catalog_metadata, "path": db_path},
             "games": game_metadata,
@@ -363,19 +368,66 @@ def extract_reviews_by_tags(
             time.sleep(game_delay)
             continue
 
-        extraction = fetch_reviews_with_metadata(
-            appid=appid,
-            language="all",
-            start_date=start_date,
-            end_date=end_date,
-            passes=passes,
-        )
-        reviews = extraction.reviews
+        reviews = None
+        cached_metadata = None
+        if review_database:
+            with ReviewStore(review_database) as store:
+                verified_cache = store.has_coverage(appid, "all", start_date, end_date)
+                unverified_cache = (
+                    allow_unverified_cache
+                    and not verified_cache
+                    and store.has_unverified_job_coverage(
+                        appid, "all", start_date, end_date
+                    )
+                )
+                if verified_cache or unverified_cache:
+                    reviews = store.get_reviews(appid, start_date, end_date, language="all")
+                    coverage = store.get_coverage(appid, "all", "recent")
+                    cached_metadata = {
+                        "complete": verified_cache,
+                        "completion_reason": (
+                            "local_database_coverage"
+                            if verified_cache
+                            else "local_database_unverified_coverage"
+                        ),
+                        "passes_executed": 0,
+                        "unique_reviews_in_date_range": len(reviews),
+                        "drift_detected": False,
+                        "passes": [],
+                        "source": "sqlite_cache",
+                        "archive": {
+                            "database": review_database,
+                            "coverage": coverage,
+                            "coverage_verified": verified_cache,
+                        },
+                    }
+                    log.info(
+                        f"  → using {len(reviews):,} cached reviews from '{review_database}'"
+                    )
+                else:
+                    log.info(
+                        f"  → local database has no complete coverage for this interval; "
+                        f"falling back to Steam"
+                    )
+
+        if reviews is None:
+            extraction = fetch_reviews_with_metadata(
+                appid=appid,
+                language="all",
+                start_date=start_date,
+                end_date=end_date,
+                passes=passes,
+            )
+            reviews = extraction.reviews
+            extraction_metadata = {**extraction.to_metadata(), "source": "steam_api"}
+        else:
+            extraction_metadata = cached_metadata
+
         game_metadata.append({
             "appid": str(appid),
             "name": name,
             "catalog_reviews": game.get("reviews"),
-            **extraction.to_metadata(),
+            **extraction_metadata,
         })
 
         for r in reviews:
@@ -389,6 +441,10 @@ def extract_reviews_by_tags(
                 "app_id":       appid,
                 "app_name":     name,
                 "recommendation_id": r.get("recommendationid"),
+                "review_version": r.get("_archive_version", 1),
+                "review_content_hash": r.get(
+                    "_archive_content_hash", review_content_hash(r)
+                ),
                 "user_id":      author.get("steamid"),
                 "country_code": None,
                 "language":     r.get("language", ""),
@@ -506,6 +562,11 @@ Examples:
                         help="Steam Web API key (or set STEAM_API_KEY env var)")
     parser.add_argument("--db",          default=DEFAULT_DB,
                         help=f"Path to local SteamSpy catalog (default: {DEFAULT_DB})")
+    parser.add_argument("--review-db",   default=None,
+                        help="Optional SQLite review archive; reuse it when coverage is complete")
+    parser.add_argument("--allow-unverified-cache", action="store_true",
+                        help="Allow resumed SQLite coverage that could not be fully verified; "
+                             "the manifest will mark the dataset incomplete")
     parser.add_argument("--appids",       nargs="+", default=None,
                         help="Specific app IDs to collect (skips catalog tag lookup)")
     parser.add_argument("--max-games",   type=int, default=10,
@@ -564,6 +625,8 @@ Examples:
         appids=args.appids,
         passes=args.passes,
         game_delay=args.game_delay,
+        review_database=args.review_db,
+        allow_unverified_cache=args.allow_unverified_cache,
     )
 
     if args.output:
