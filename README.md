@@ -7,7 +7,7 @@
 
 ## Overview
 
-This project is a Python package with three CLI tools that work together:
+This project is a Python package with four CLI tools that work together:
 
 | Command | Description |
 |---------|-------------|
@@ -26,6 +26,8 @@ This project is a Python package with three CLI tools that work together:
 - 💾 **CSV / JSON output** via pandas
 - 🧾 **Research manifest** with query provenance, coverage and completeness diagnostics
 - 🗄️ **Incremental SQLite archive** with checkpoints, resume, deduplication and versions
+- 🧩 **Language-partitioned archival** for `--language all`, with independent cursors and consolidated coverage
+- 🚫 **Off-topic reviews excluded** from incremental research collections
 - 🗂️ **Incremental catalog saves** — SteamSpy fetcher resumes interrupted runs
 - 🕐 Timestamps converted to `dd/mm/yyyy` readable format
 
@@ -135,6 +137,12 @@ steam-extractor --appids 730 1091500 1245620 \
 SQLite is embedded: no database server or continuously running process is required. Each
 CLI invocation opens the file, commits pages transactionally and closes it on exit.
 
+`--language all` partitions the archive into one independent cursor stream for every
+Steam-supported review language. This avoids premature exhaustion of a single very large
+`language=all` stream. Rows are still merged into one archive by `recommendationid`, and
+the synthetic `all` coverage is marked verified only after every language partition is
+verified. Steam's off-topic activity remains excluded.
+
 ```bash
 # Archive reviews down to the beginning of 2024, pausing after 30 minutes if necessary
 steam-reviews-sync 730 --language all --start 01/01/2024 \
@@ -143,6 +151,10 @@ steam-reviews-sync 730 --language all --start 01/01/2024 \
 # Continue a paused/failed cursor checkpoint
 steam-reviews-sync 730 --language all --start 01/01/2024 \
     --database steam_reviews.sqlite --max-runtime 1800 --resume
+
+# Collect only one language (aliases such as pt-br and en are accepted)
+steam-reviews-sync 1091500 --language pt-br \
+    --database cyberpunk_reviews.sqlite
 ```
 
 Each page and its next cursor are committed in the same SQLite transaction. A repeated
@@ -150,25 +162,42 @@ Each page and its next cursor are committed in the same SQLite transaction. A re
 is updated and the observed version is appended to `review_versions`.
 
 An empty API page is not sufficient to declare the entire history complete. The synchronizer
-also compares the cumulative number of reviews received with Steam's `total_reviews`, allowing
-only a small tolerance for live-stream drift. If the API stream ends with a material deficit,
-the run is marked `incomplete` with reason `api_exhausted_before_expected_total`; reviews and
-verified temporal bounds already collected remain available in SQLite.
+confirms an unexpected empty page three times at the same cursor and continues if any retry
+returns reviews. It also compares the cumulative number of reviews received with Steam's
+`total_reviews`, allowing only a small tolerance for live-stream drift. If all confirmations
+remain empty with a material deficit, the run is marked `incomplete` with reason
+`api_exhausted_before_expected_total`; reviews and verified temporal bounds already collected
+remain available in SQLite.
 
 On later non-resume runs, synchronization starts at the live head and stops after three
 fully known pages by default. The `updated` ordering is also checked after an existing
 archive is present. A resumed cursor is followed by a head reconciliation because Steam's
-review stream is live; resumed coverage remains conservative when continuity cannot be
-proven.
+review stream is live. That reconciliation is a full independent verification pass, not
+only a short overlap check. If it finds new recommendation IDs, another full pass starts
+from the live head until a pass adds no IDs or the configured verification limit is reached.
+
+The command reports two distinct completion indicators:
+
+- `operational_complete`: the requested cursor traversal reached its stopping condition;
+- `research_verified`: an uninterrupted traversal satisfied the expected-total check, and
+  recovery verification (when required) converged without adding another recommendation ID.
+
+Runs recovered from an `incomplete` state also restart at the live head and use the same
+convergence rule. The SQLite `sync_runs` table records whether each run was a verification
+pass, both completion indicators, and cumulative progress across resumed processes for later
+auditing. Totals for languages with zero reviews are persisted even though no review page is
+written.
 
 Useful limits:
 
 | Argument | Description |
 |----------|-------------|
+| `--language CODE` | `all` partitions all supported languages; a code collects only that language |
 | `--max-pages N` | Pause after N pages in this invocation |
 | `--max-runtime SECONDS` | Pause after the requested wall-clock duration |
 | `--resume` | Continue a paused or failed checkpoint |
 | `--overlap-pages N` | Known consecutive pages required before incremental stop |
+| `--verification-passes N` | Maximum full verification passes after a resumed or incomplete run (default: `3`) |
 | `--no-sync-updates` | Skip the separate check for recently edited reviews |
 
 Pressing `Ctrl+C` rolls back an unfinished page, marks the synchronization as
@@ -188,10 +217,12 @@ If verified local coverage is unavailable, `steam-extractor` logs that fact and 
 to the Steam API. The research manifest records whether each game came from `sqlite_cache`
 or `steam_api`.
 
-A cursor resumed across separate processes cannot prove that the live Steam stream did not
-shift at the boundary. Such data remains stored but is not reused by default. For exploratory
-work, `--allow-unverified-cache` permits reuse while forcing `dataset_complete: false` in the
-manifest; confirmatory research should retain the conservative default.
+A cursor resumed across separate processes cannot by itself prove that the live Steam stream
+did not shift at the boundary. Such data becomes verified only after the independent
+full-pass convergence described above. Data that has not converged remains stored but is not
+reused by default. For exploratory work, `--allow-unverified-cache` permits reuse while
+forcing `dataset_complete: false` in the manifest; confirmatory research should retain the
+conservative default.
 
 ## Output Schema (`steam-extractor`)
 
