@@ -1,11 +1,19 @@
+import sqlite3
 import tempfile
 import unittest
+from argparse import Namespace
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from steam_extractor.review_store import ReviewStore, expected_total_reached
-from steam_extractor.reviews_sync import sync_filter
+from steam_extractor.reviews_sync import (
+    _request_page,
+    main,
+    sync_filter,
+    sync_partitioned_reviews,
+    sync_reviews,
+)
 
 
 def review(review_id: str, text: str = "original", timestamp: int = 1704067200) -> dict:
@@ -135,6 +143,8 @@ class ReviewStoreTests(unittest.TestCase):
             reason="end_of_history",
             complete_history=True,
             verified_coverage=True,
+            operational_complete=True,
+            research_verified=True,
         )
         self.store.close()
 
@@ -148,11 +158,272 @@ class ReviewStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_job("730", "all", "recent")["status"], "incomplete")
         coverage = self.store.get_coverage("730", "all", "recent")
         self.assertEqual(coverage["complete_history"], 0)
+        self.assertEqual(self.store.get_run("legacy")["operational_complete"], 0)
+        self.assertEqual(self.store.get_run("legacy")["research_verified"], 0)
         self.assertIsNotNone(coverage["oldest_timestamp"])
         self.assertEqual(self.store.count_reviews("730"), 1)
 
+    def test_schema_v2_migrates_cumulative_received(self):
+        self.store.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute("ALTER TABLE sync_runs DROP COLUMN cumulative_received")
+        connection.execute("UPDATE schema_info SET version = 2")
+        connection.commit()
+        connection.close()
+
+        self.store = ReviewStore(self.path)
+
+        columns = {
+            row["name"]
+            for row in self.store.connection.execute("PRAGMA table_info(sync_runs)")
+        }
+        version = self.store.connection.execute(
+            "SELECT version FROM schema_info"
+        ).fetchone()["version"]
+        self.assertIn("cumulative_received", columns)
+        self.assertEqual(version, 3)
+
+    def test_partitioned_coverage_is_consolidated_as_all_languages(self):
+        for language, timestamp in (("english", 100), ("brazilian", 200)):
+            self.store.start_run(f"run-{language}", "730", language, "recent")
+            self.store.save_page(
+                run_id=f"run-{language}",
+                app_id="730",
+                language=language,
+                filter_type="recent",
+                reviews=[review(language, timestamp=timestamp)],
+                next_cursor="end",
+                expected_reviews=1,
+                page_number=1,
+                total_received=1,
+            )
+            self.store.finish_run(
+                f"run-{language}",
+                "730",
+                language,
+                "recent",
+                status="complete",
+                reason="end_of_history",
+                complete_history=True,
+                verified_coverage=True,
+                operational_complete=True,
+                research_verified=True,
+            )
+
+        self.store.set_partitioned_coverage(
+            "730", ("english", "brazilian"), filter_type="recent"
+        )
+
+        aggregate = self.store.get_coverage("730", "all", "recent")
+        self.assertEqual(aggregate["complete_history"], 1)
+        self.assertEqual(aggregate["oldest_timestamp"], 100)
+        self.assertEqual(aggregate["newest_timestamp"], 200)
+
 
 class SyncResumeTests(unittest.TestCase):
+    @patch("steam_extractor.reviews_sync.time.sleep")
+    @patch("steam_extractor.reviews_sync._request_page")
+    def test_pending_verification_survives_until_the_next_command(
+        self, request_page, _sleep
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                store.start_run("operational", "730", "all", "recent")
+                store.save_page(
+                    run_id="operational",
+                    app_id="730",
+                    language="all",
+                    filter_type="recent",
+                    reviews=[review("1")],
+                    next_cursor="end",
+                    expected_reviews=1,
+                    page_number=1,
+                    total_received=1,
+                )
+                store.finish_run(
+                    "operational",
+                    "730",
+                    "all",
+                    "recent",
+                    status="complete",
+                    reason="end_of_history",
+                    operational_complete=True,
+                    research_verified=False,
+                )
+
+            request_page.side_effect = [
+                {
+                    "success": 1,
+                    "cursor": "verification-end",
+                    "query_summary": {"total_reviews": 1},
+                    "reviews": [review("1")],
+                },
+                {"success": 1, "cursor": "verification-end", "reviews": []},
+            ]
+            result = sync_reviews(path, "730", sync_updates=False)
+
+        self.assertTrue(result["recent"]["verification_pass"])
+        self.assertTrue(result["research_verified"])
+        self.assertEqual(result["verification_passes"], [])
+
+    @patch("steam_extractor.reviews_sync.time.sleep")
+    @patch("steam_extractor.reviews_sync._request_page")
+    def test_resumed_collection_requires_full_converged_verification(
+        self, request_page, _sleep
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                store.start_run("paused", "730", "all", "recent")
+                store.save_page(
+                    run_id="paused",
+                    app_id="730",
+                    language="all",
+                    filter_type="recent",
+                    reviews=[review("1")],
+                    next_cursor="resume-here",
+                    expected_reviews=1,
+                    page_number=1,
+                    total_received=1,
+                )
+                store.finish_run(
+                    "paused",
+                    "730",
+                    "all",
+                    "recent",
+                    status="paused",
+                    reason="user_interrupted",
+                )
+
+            request_page.side_effect = [
+                # Finish the cursor-based operational resume.
+                {"success": 1, "cursor": "resume-here", "reviews": []},
+                # Verification 1 finds a review missed at the interruption boundary.
+                {
+                    "success": 1,
+                    "cursor": "verify-1-end",
+                    "query_summary": {"total_reviews": 2},
+                    "reviews": [review("1"), review("2")],
+                },
+                {"success": 1, "cursor": "verify-1-end", "reviews": []},
+                # Verification 2 converges without adding another recommendation ID.
+                {
+                    "success": 1,
+                    "cursor": "verify-2-end",
+                    "query_summary": {"total_reviews": 2},
+                    "reviews": [review("1"), review("2")],
+                },
+                {"success": 1, "cursor": "verify-2-end", "reviews": []},
+            ]
+            result = sync_reviews(
+                path,
+                "730",
+                resume=True,
+                sync_updates=False,
+            )
+
+            with ReviewStore(path) as store:
+                runs = store.connection.execute(
+                    """
+                    SELECT verification_pass, operational_complete, research_verified
+                    FROM sync_runs WHERE run_id != 'paused' ORDER BY started_at, rowid
+                    """
+                ).fetchall()
+                coverage = store.get_coverage("730", "all", "recent")
+
+        self.assertTrue(result["operational_complete"])
+        self.assertTrue(result["research_verified"])
+        self.assertEqual(len(result["verification_passes"]), 2)
+        self.assertEqual(result["verification_passes"][0]["inserted"], 1)
+        self.assertFalse(result["verification_passes"][0]["research_verified"])
+        self.assertEqual(result["verification_passes"][1]["inserted"], 0)
+        self.assertTrue(result["verification_passes"][1]["research_verified"])
+        self.assertEqual(
+            [tuple(row) for row in runs],
+            [(0, 1, 0), (1, 1, 0), (1, 1, 1)],
+        )
+        self.assertEqual(coverage["complete_history"], 1)
+
+
+class LanguagePartitionTests(unittest.TestCase):
+    @patch("steam_extractor.reviews_sync.requests.get")
+    def test_api_request_explicitly_excludes_offtopic_reviews(self, get):
+        response = Mock()
+        response.content = b'{"success": 1, "reviews": []}'
+        response.raise_for_status.return_value = None
+        get.return_value = response
+
+        _request_page("730", "english", "recent", "*")
+
+        self.assertEqual(
+            get.call_args.kwargs["params"]["filter_offtopic_activity"], 1
+        )
+
+    @patch("steam_extractor.reviews_sync.SUPPORTED_REVIEW_LANGUAGES", ("english", "brazilian"))
+    @patch("steam_extractor.reviews_sync.sync_reviews")
+    def test_all_languages_are_independent_partitions(self, sync_one):
+        def result_for_language(*, language, **_kwargs):
+            return {
+                "language": language,
+                "operational_complete": False,
+                "research_verified": False,
+                "recent": {
+                    "pages": 1,
+                    "expected_reviews": 10,
+                    "reason": "api_exhausted_before_expected_total",
+                },
+                "verification_passes": [],
+                "updated": None,
+            }
+
+        sync_one.side_effect = result_for_language
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = sync_partitioned_reviews(
+                str(Path(temp_dir) / "reviews.sqlite"),
+                "730",
+                sync_updates=False,
+            )
+
+        self.assertEqual(
+            [call.kwargs["language"] for call in sync_one.call_args_list],
+            ["english", "brazilian"],
+        )
+        self.assertEqual(result["partition_strategy"], "language")
+        self.assertFalse(result["offtopic_reviews_included"])
+        self.assertEqual(result["expected_reviews_sum"], 20)
+
+    @patch("steam_extractor.reviews_sync.sync_partitioned_reviews")
+    @patch("steam_extractor.reviews_sync.sync_reviews")
+    @patch("steam_extractor.reviews_sync.argparse.ArgumentParser.parse_args")
+    @patch("builtins.print")
+    def test_explicit_language_does_not_use_partitioned_mode(
+        self, _print, parse_args, sync_one, sync_all
+    ):
+        parse_args.return_value = Namespace(
+            appid="730",
+            language="pt-br",
+            start=None,
+            database="reviews.sqlite",
+            resume=False,
+            max_pages=None,
+            max_runtime=None,
+            overlap_pages=3,
+            verification_passes=3,
+            no_sync_updates=True,
+        )
+        sync_one.return_value = {
+            "recent": {"reason": "end_of_history"},
+            "verification_passes": [],
+            "updated": None,
+        }
+
+        self.assertEqual(main(), 0)
+        self.assertEqual(sync_one.call_args.kwargs["language"], "brazilian")
+        sync_all.assert_not_called()
+
+
+class SyncResumeContinuedTests(unittest.TestCase):
     @patch("steam_extractor.reviews_sync.time.sleep")
     @patch("steam_extractor.reviews_sync._request_page")
     def test_ctrl_c_marks_checkpoint_paused_and_allows_resume(self, request_page, _sleep):
@@ -231,6 +502,8 @@ class SyncResumeTests(unittest.TestCase):
                 "reviews": [review("1")],
             },
             {"success": 1, "cursor": "cursor-2", "reviews": []},
+            {"success": 1, "cursor": "cursor-2", "reviews": []},
+            {"success": 1, "cursor": "cursor-2", "reviews": []},
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -250,6 +523,76 @@ class SyncResumeTests(unittest.TestCase):
         self.assertEqual(result.cumulative_received, 1)
         self.assertTrue(result.coverage_verified)
         self.assertEqual(coverage["complete_history"], 0)
+        self.assertEqual(request_page.call_count, 4)
+
+    @patch("steam_extractor.reviews_sync.time.sleep")
+    @patch("steam_extractor.reviews_sync._request_page")
+    def test_transient_empty_page_continues_from_same_cursor(
+        self, request_page, _sleep
+    ):
+        request_page.side_effect = [
+            {
+                "success": 1,
+                "cursor": "cursor-2",
+                "query_summary": {"total_reviews": 2},
+                "reviews": [review("1")],
+            },
+            {"success": 1, "cursor": "cursor-2", "reviews": []},
+            {
+                "success": 1,
+                "cursor": "cursor-3",
+                "reviews": [review("2")],
+            },
+            {"success": 1, "cursor": "cursor-3", "reviews": []},
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                result = sync_filter(
+                    store,
+                    app_id="730",
+                    language="english",
+                    filter_type="recent",
+                )
+
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.cumulative_received, 2)
+        self.assertEqual(result.inserted, 2)
+        self.assertEqual(request_page.call_args_list[2].args[3], "cursor-2")
+
+    @patch("steam_extractor.reviews_sync.time.sleep")
+    @patch("steam_extractor.reviews_sync._request_page")
+    def test_zero_review_total_is_persisted_and_remains_verified(
+        self, request_page, _sleep
+    ):
+        request_page.return_value = {
+            "success": 1,
+            "cursor": "*",
+            "query_summary": {"total_reviews": 0},
+            "reviews": [],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "reviews.sqlite")
+            with ReviewStore(path) as store:
+                result = sync_filter(
+                    store,
+                    app_id="730",
+                    language="arabic",
+                    filter_type="recent",
+                )
+                run_id = result.run_id
+
+            with ReviewStore(path) as reopened:
+                persisted = reopened.get_run(run_id)
+
+        self.assertEqual(result.status, "complete")
+        self.assertTrue(result.research_verified)
+        self.assertEqual(persisted["expected_reviews"], 0)
+        self.assertEqual(persisted["status"], "complete")
+        self.assertEqual(persisted["operational_complete"], 1)
+        self.assertEqual(persisted["research_verified"], 1)
 
     @patch("steam_extractor.reviews_sync.time.sleep")
     @patch("steam_extractor.reviews_sync._request_page")

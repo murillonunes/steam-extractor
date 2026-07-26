@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 EXPECTED_TOTAL_TOLERANCE_RATIO = 0.001
 EXPECTED_TOTAL_MIN_TOLERANCE = 100
 
@@ -142,7 +142,11 @@ class ReviewStore:
                 duplicates INTEGER NOT NULL DEFAULT 0,
                 expected_reviews INTEGER,
                 oldest_timestamp INTEGER,
-                newest_timestamp INTEGER
+                newest_timestamp INTEGER,
+                verification_pass INTEGER NOT NULL DEFAULT 0,
+                operational_complete INTEGER NOT NULL DEFAULT 0,
+                research_verified INTEGER NOT NULL DEFAULT 0,
+                cumulative_received INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS run_reviews (
@@ -195,12 +199,48 @@ class ReviewStore:
             self.connection.execute(
                 "INSERT INTO schema_info(version) VALUES (?)", (SCHEMA_VERSION,)
             )
-        elif row["version"] != SCHEMA_VERSION:
+            schema_version = SCHEMA_VERSION
+        else:
+            schema_version = int(row["version"])
+            if schema_version == 1:
+                self._migrate_schema_v1_to_v2()
+                schema_version = 2
+            if schema_version == 2:
+                self._migrate_schema_v2_to_v3()
+                schema_version = 3
+        if schema_version != SCHEMA_VERSION:
             raise RuntimeError(
-                f"Unsupported review database schema {row['version']} (expected {SCHEMA_VERSION})"
+                f"Unsupported review database schema {schema_version} "
+                f"(expected {SCHEMA_VERSION})"
             )
         self._reclassify_premature_history_completions()
         self.connection.commit()
+
+    def _migrate_schema_v1_to_v2(self) -> None:
+        """Adds auditable completion fields without rewriting archived reviews."""
+        self.connection.executescript(
+            """
+            ALTER TABLE sync_runs
+                ADD COLUMN verification_pass INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sync_runs
+                ADD COLUMN operational_complete INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sync_runs
+                ADD COLUMN research_verified INTEGER NOT NULL DEFAULT 0;
+            UPDATE sync_runs
+            SET operational_complete = CASE WHEN status = 'complete' THEN 1 ELSE 0 END;
+            UPDATE schema_info SET version = 2;
+            """
+        )
+
+    def _migrate_schema_v2_to_v3(self) -> None:
+        """Stores cumulative progress separately from per-process run counts."""
+        self.connection.executescript(
+            """
+            ALTER TABLE sync_runs ADD COLUMN cumulative_received INTEGER;
+            UPDATE sync_runs SET cumulative_received = received;
+            UPDATE schema_info SET version = 3;
+            """
+        )
 
     def _reclassify_premature_history_completions(self) -> None:
         """Repairs legacy runs that treated any empty page as complete history."""
@@ -214,13 +254,20 @@ class ReviewStore:
         ).fetchall()
         affected_keys: set[tuple[str, str, str]] = set()
         for run in suspect_runs:
-            if expected_total_reached(run["received"], run["expected_reviews"]):
+            cumulative_received = (
+                run["cumulative_received"]
+                if run["cumulative_received"] is not None
+                else run["received"]
+            )
+            if expected_total_reached(cumulative_received, run["expected_reviews"]):
                 continue
             self.connection.execute(
                 """
                 UPDATE sync_runs
                 SET status = 'incomplete',
-                    completion_reason = 'api_exhausted_before_expected_total'
+                    completion_reason = 'api_exhausted_before_expected_total',
+                    operational_complete = 0,
+                    research_verified = 0
                 WHERE run_id = ?
                 """,
                 (run["run_id"],),
@@ -244,14 +291,21 @@ class ReviewStore:
         for app_id, language, filter_type in affected_keys:
             valid_runs = self.connection.execute(
                 """
-                SELECT received, expected_reviews FROM sync_runs
+                SELECT received, cumulative_received, expected_reviews FROM sync_runs
                 WHERE app_id = ? AND language = ? AND filter_type = ?
                   AND status = 'complete' AND completion_reason = 'end_of_history'
                 """,
                 (app_id, language, filter_type),
             ).fetchall()
             if any(
-                expected_total_reached(run["received"], run["expected_reviews"])
+                expected_total_reached(
+                    (
+                        run["cumulative_received"]
+                        if run["cumulative_received"] is not None
+                        else run["received"]
+                    ),
+                    run["expected_reviews"],
+                )
                 for run in valid_runs
             ):
                 continue
@@ -292,13 +346,23 @@ class ReviewStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def start_run(self, run_id: str, app_id: str, language: str, filter_type: str) -> None:
+    def start_run(
+        self,
+        run_id: str,
+        app_id: str,
+        language: str,
+        filter_type: str,
+        *,
+        verification_pass: bool = False,
+    ) -> None:
         self.connection.execute(
             """
-            INSERT INTO sync_runs(run_id, app_id, language, filter_type, started_at, status)
-            VALUES (?, ?, ?, ?, ?, 'running')
+            INSERT INTO sync_runs(
+                run_id, app_id, language, filter_type, started_at, status, verification_pass
+            )
+            VALUES (?, ?, ?, ?, ?, 'running', ?)
             """,
-            (run_id, app_id, language, filter_type, utc_now()),
+            (run_id, app_id, language, filter_type, utc_now(), int(verification_pass)),
         )
         self.connection.commit()
 
@@ -510,14 +574,31 @@ class ReviewStore:
         reason: str,
         complete_history: bool = False,
         verified_coverage: bool = False,
+        operational_complete: bool = False,
+        research_verified: bool = False,
+        expected_reviews: int | None = None,
+        cumulative_received: int | None = None,
     ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """
-                UPDATE sync_runs SET finished_at = ?, status = ?, completion_reason = ?
+                UPDATE sync_runs SET
+                    finished_at = ?, status = ?, completion_reason = ?,
+                    operational_complete = ?, research_verified = ?,
+                    expected_reviews = COALESCE(?, expected_reviews),
+                    cumulative_received = COALESCE(?, cumulative_received)
                 WHERE run_id = ?
                 """,
-                (utc_now(), status, reason, run_id),
+                (
+                    utc_now(),
+                    status,
+                    reason,
+                    int(operational_complete),
+                    int(research_verified),
+                    expected_reviews,
+                    cumulative_received,
+                    run_id,
+                ),
             )
             run = connection.execute(
                 "SELECT * FROM sync_runs WHERE run_id = ?",
@@ -571,6 +652,20 @@ class ReviewStore:
         if row is None:
             raise KeyError(run_id)
         return dict(row)
+
+    def get_latest_run(
+        self, app_id: str, language: str, filter_type: str
+    ) -> dict | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM sync_runs
+            WHERE app_id = ? AND language = ? AND filter_type = ?
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (str(app_id), language, filter_type),
+        ).fetchone()
+        return dict(row) if row else None
 
     def get_reviews(
         self,
@@ -686,9 +781,81 @@ class ReviewStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def count_reviews(self, app_id: str | None = None) -> int:
+    def set_partitioned_coverage(
+        self,
+        app_id: str,
+        languages: Iterable[str],
+        *,
+        filter_type: str,
+    ) -> None:
+        """Consolidates verified language coverage into the synthetic `all` partition."""
+        language_list = list(languages)
+        placeholders = ",".join("?" for _ in language_list)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM coverage
+            WHERE app_id = ? AND filter_type = ?
+              AND language IN ({placeholders})
+            """,
+            [str(app_id), filter_type, *language_list],
+        ).fetchall()
+        if len(rows) != len(language_list):
+            raise ValueError("Cannot aggregate coverage before every language is verified")
+
+        complete_history = all(bool(row["complete_history"]) for row in rows)
+        oldest_values = [
+            int(row["oldest_timestamp"])
+            for row in rows
+            if row["oldest_timestamp"] is not None
+        ]
+        newest_values = [
+            int(row["newest_timestamp"])
+            for row in rows
+            if row["newest_timestamp"] is not None
+        ]
+        if complete_history:
+            oldest = min(oldest_values, default=None)
+            newest = max(newest_values, default=None)
+        else:
+            oldest = max(oldest_values, default=None)
+            newest = min(newest_values, default=None)
+
+        self.connection.execute(
+            """
+            INSERT INTO coverage(
+                app_id, language, filter_type, oldest_timestamp,
+                newest_timestamp, complete_history, updated_at
+            ) VALUES (?, 'all', ?, ?, ?, ?, ?)
+            ON CONFLICT(app_id, language, filter_type) DO UPDATE SET
+                oldest_timestamp = excluded.oldest_timestamp,
+                newest_timestamp = excluded.newest_timestamp,
+                complete_history = excluded.complete_history,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(app_id),
+                filter_type,
+                oldest,
+                newest,
+                int(complete_history),
+                utc_now(),
+            ),
+        )
+        self.connection.commit()
+
+    def count_reviews(
+        self, app_id: str | None = None, language: str = "all"
+    ) -> int:
         if app_id is None:
             row = self.connection.execute("SELECT COUNT(*) AS count FROM reviews").fetchone()
+        elif language != "all":
+            row = self.connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM reviews
+                WHERE app_id = ? AND language = ?
+                """,
+                (str(app_id), language),
+            ).fetchone()
         else:
             row = self.connection.execute(
                 "SELECT COUNT(*) AS count FROM reviews WHERE app_id = ?", (str(app_id),)

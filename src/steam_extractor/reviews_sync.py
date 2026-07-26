@@ -18,6 +18,40 @@ from steam_extractor.reviews_fetcher import BASE_URL, map_language, parse_date
 
 log = logging.getLogger(__name__)
 DEFAULT_DATABASE = "steam_reviews.sqlite"
+EMPTY_PAGE_CONFIRMATIONS = 3
+SUPPORTED_REVIEW_LANGUAGES = (
+    "arabic",
+    "bulgarian",
+    "schinese",
+    "tchinese",
+    "czech",
+    "danish",
+    "dutch",
+    "english",
+    "finnish",
+    "french",
+    "german",
+    "greek",
+    "hungarian",
+    "indonesian",
+    "italian",
+    "japanese",
+    "koreana",
+    "malay",
+    "norwegian",
+    "polish",
+    "portuguese",
+    "brazilian",
+    "romanian",
+    "russian",
+    "spanish",
+    "latam",
+    "swedish",
+    "thai",
+    "turkish",
+    "ukrainian",
+    "vietnamese",
+)
 
 
 @dataclass
@@ -33,6 +67,9 @@ class SyncResult:
     duplicates: int
     resumed: bool
     coverage_verified: bool
+    operational_complete: bool
+    research_verified: bool
+    verification_pass: bool
     expected_reviews: int | None
     cumulative_received: int
 
@@ -50,6 +87,7 @@ def _request_page(
         "filter": filter_type,
         "review_type": "all",
         "purchase_type": "all",
+        "filter_offtopic_activity": 1,
         "num_per_page": 100,
         "cursor": cursor,
     }
@@ -83,6 +121,14 @@ def _request_page(
     raise AssertionError("unreachable")
 
 
+def _reported_total(data: dict) -> int | None:
+    reported = data.get("query_summary", {}).get("total_reviews")
+    try:
+        return int(reported)
+    except (TypeError, ValueError):
+        return None
+
+
 def sync_filter(
     store: ReviewStore,
     *,
@@ -95,6 +141,7 @@ def sync_filter(
     max_runtime: float | None = None,
     overlap_pages: int = 3,
     allow_unverified_overlap: bool = False,
+    verification_pass: bool = False,
 ) -> SyncResult:
     """Synchronizes one Steam ordering with transactional page checkpoints."""
     run_id = uuid.uuid4().hex
@@ -130,7 +177,13 @@ def sync_filter(
     reason = "unknown"
     complete_history = False
 
-    store.start_run(run_id, app_id, language, filter_type)
+    store.start_run(
+        run_id,
+        app_id,
+        language,
+        filter_type,
+        verification_pass=verification_pass,
+    )
     log.info(
         "Sync %s app=%s language=%s filter=%s cursor=%s",
         "resume" if resumed else "start",
@@ -153,11 +206,37 @@ def sync_filter(
             data = _request_page(app_id, language, filter_type, cursor)
             reviews = data.get("reviews") or []
             if expected_reviews is None:
-                reported = data.get("query_summary", {}).get("total_reviews")
-                try:
-                    expected_reviews = int(reported)
-                except (TypeError, ValueError):
-                    expected_reviews = None
+                expected_reviews = _reported_total(data)
+
+            if not reviews and not expected_total_reached(
+                total_received, expected_reviews
+            ):
+                for confirmation in range(2, EMPTY_PAGE_CONFIRMATIONS + 1):
+                    wait = min(2 ** (confirmation - 2), 5)
+                    log.warning(
+                        "Unexpected empty page at cursor; confirming %s/%s in %ss "
+                        "(received=%s expected=%s)",
+                        confirmation,
+                        EMPTY_PAGE_CONFIRMATIONS,
+                        wait,
+                        total_received,
+                        expected_reviews,
+                    )
+                    time.sleep(wait)
+                    candidate = _request_page(
+                        app_id, language, filter_type, cursor
+                    )
+                    if expected_reviews is None:
+                        expected_reviews = _reported_total(candidate)
+                    if candidate.get("reviews"):
+                        data = candidate
+                        reviews = candidate["reviews"]
+                        log.info(
+                            "Empty page was transient; synchronization continues"
+                        )
+                        break
+                    if expected_total_reached(total_received, expected_reviews):
+                        break
 
             if not reviews:
                 if expected_total_reached(total_received, expected_reviews):
@@ -225,7 +304,8 @@ def sync_filter(
                 break
 
             if (
-                not resumed
+                not verification_pass
+                and not resumed
                 and incremental_overlap_allowed
                 and known_before == len(reviews)
             ):
@@ -254,12 +334,45 @@ def sync_filter(
             filter_type,
             status=status,
             reason=reason,
+            expected_reviews=expected_reviews,
+            cumulative_received=total_received,
         )
         raise
 
+    operational_complete = status == "complete"
+    expected_total_verified = (
+        reason == "start_date_reached"
+        or (
+            reason == "end_of_history"
+            and expected_total_reached(total_received, expected_reviews)
+        )
+    )
+    inherited_verified_coverage = bool(
+        existing_coverage
+        and reason == "known_overlap_reached"
+        and operational_complete
+    )
+    research_verified = (
+        filter_type == "recent"
+        and (
+            inherited_verified_coverage
+            or (
+                not resumed
+                and operational_complete
+                and expected_total_verified
+                and (not verification_pass or totals["inserted"] == 0)
+            )
+        )
+    )
+    complete_history = (
+        filter_type == "recent"
+        and reason == "end_of_history"
+        and research_verified
+    )
     coverage_verified = (
         not resumed
         and not allow_unverified_overlap
+        and (not verification_pass or research_verified)
         and reason
         in {
             "end_of_history",
@@ -278,6 +391,10 @@ def sync_filter(
         reason=reason,
         complete_history=complete_history,
         verified_coverage=coverage_verified,
+        operational_complete=operational_complete,
+        research_verified=research_verified,
+        expected_reviews=expected_reviews,
+        cumulative_received=total_received,
     )
     return SyncResult(
         run_id=run_id,
@@ -287,6 +404,9 @@ def sync_filter(
         received=sum(totals.values()),
         resumed=resumed,
         coverage_verified=coverage_verified,
+        operational_complete=operational_complete,
+        research_verified=research_verified,
+        verification_pass=verification_pass,
         expected_reviews=expected_reviews,
         cumulative_received=total_received,
         **totals,
@@ -303,8 +423,9 @@ def sync_reviews(
     max_runtime: float | None = None,
     overlap_pages: int = 3,
     sync_updates: bool = True,
+    verification_passes: int = 3,
 ) -> dict:
-    """Synchronizes newly created reviews and, when useful, recently updated reviews."""
+    """Synchronizes reviews and verifies recovery runs with independent full passes."""
     command_started = time.monotonic()
 
     def remaining_runtime() -> float | None:
@@ -314,7 +435,25 @@ def sync_reviews(
 
     with ReviewStore(database) as store:
         pages_used = 0
-        had_reviews = store.count_reviews(app_id) > 0
+        had_reviews = store.count_reviews(app_id, language) > 0
+        previous_job = store.get_job(str(app_id), language, "recent")
+        previous_run = store.get_latest_run(str(app_id), language, "recent")
+        recovery_required = bool(
+            (
+                previous_job
+                and previous_job["status"] in {"paused", "failed", "incomplete"}
+            )
+            or (
+                previous_run
+                and previous_run["operational_complete"]
+                and not previous_run["research_verified"]
+            )
+        )
+        cursor_resume_expected = bool(
+            resume
+            and previous_job
+            and previous_job["status"] in {"paused", "failed"}
+        )
         recent = sync_filter(
             store,
             app_id=str(app_id),
@@ -325,38 +464,62 @@ def sync_reviews(
             max_pages=max_pages,
             max_runtime=remaining_runtime(),
             overlap_pages=overlap_pages,
+            verification_pass=recovery_required and not cursor_resume_expected,
         )
         pages_used += recent.pages
-        reconciliation = None
-        remaining = remaining_runtime()
-        remaining_pages = None if max_pages is None else max(max_pages - pages_used, 0)
-        if (
-            recent.resumed
-            and recent.status == "complete"
-            and (remaining is None or remaining > 0)
-            and (remaining_pages is None or remaining_pages > 0)
+        verification_results: list[SyncResult] = []
+        recovery_requires_verification = recovery_required
+        while (
+            recovery_requires_verification
+            and recent.operational_complete
+            and not (
+                recent.research_verified
+                or any(result.research_verified for result in verification_results)
+            )
+            and len(verification_results) < verification_passes
         ):
-            log.info("Reconciling the live head after cursor-based resume")
-            reconciliation = sync_filter(
+            remaining = remaining_runtime()
+            remaining_pages = None if max_pages is None else max(max_pages - pages_used, 0)
+            if (
+                (remaining is not None and remaining <= 0)
+                or (remaining_pages is not None and remaining_pages <= 0)
+            ):
+                break
+            pass_number = len(verification_results) + 1
+            log.info(
+                "Research verification pass %s/%s from the live head",
+                pass_number,
+                verification_passes,
+            )
+            verification = sync_filter(
                 store,
                 app_id=str(app_id),
                 language=language,
                 filter_type="recent",
-                start_date=None,
+                start_date=start_date,
                 resume=False,
                 max_pages=remaining_pages,
                 max_runtime=remaining,
                 overlap_pages=overlap_pages,
-                allow_unverified_overlap=True,
+                verification_pass=True,
             )
-            pages_used += reconciliation.pages
+            verification_results.append(verification)
+            pages_used += verification.pages
+            if not verification.operational_complete:
+                break
+        research_verified = recent.research_verified or any(
+            result.research_verified for result in verification_results
+        )
+        operational_complete = recent.operational_complete
+        reconciliation = verification_results[0] if verification_results else None
         updated = None
         remaining = remaining_runtime()
         remaining_pages = None if max_pages is None else max(max_pages - pages_used, 0)
         if (
             sync_updates
             and had_reviews
-            and recent.status == "complete"
+            and recent.reason == "known_overlap_reached"
+            and (not recovery_requires_verification or research_verified)
             and (remaining is None or remaining > 0)
             and (remaining_pages is None or remaining_pages > 0)
         ):
@@ -373,11 +536,146 @@ def sync_reviews(
             "database": database,
             "app_id": str(app_id),
             "language": language,
+            "operational_complete": operational_complete,
+            "research_verified": research_verified,
             "recent": recent.__dict__,
             "reconciliation": reconciliation.__dict__ if reconciliation else None,
+            "verification_passes": [
+                result.__dict__ for result in verification_results
+            ],
             "updated": updated.__dict__ if updated else None,
             "stored_reviews": store.count_reviews(app_id),
         }
+
+
+def _pages_used(result: dict) -> int:
+    phases = [
+        result["recent"],
+        *result["verification_passes"],
+        result["updated"],
+    ]
+    return sum(phase["pages"] for phase in phases if phase)
+
+
+def _result_phases(result: dict) -> list[dict | None]:
+    if result.get("partition_strategy") == "language":
+        return [
+            phase
+            for partition in result["partitions"]
+            for phase in _result_phases(partition)
+        ]
+    return [
+        result["recent"],
+        *result["verification_passes"],
+        result["updated"],
+    ]
+
+
+def sync_partitioned_reviews(
+    database: str,
+    app_id: str,
+    start_date: date | None = None,
+    resume: bool = False,
+    max_pages: int | None = None,
+    max_runtime: float | None = None,
+    overlap_pages: int = 3,
+    sync_updates: bool = True,
+    verification_passes: int = 3,
+) -> dict:
+    """Synchronizes every supported review language as an independent cursor stream."""
+    command_started = time.monotonic()
+    pages_used = 0
+    partitions: list[dict] = []
+
+    for language in SUPPORTED_REVIEW_LANGUAGES:
+        remaining_runtime = (
+            None
+            if max_runtime is None
+            else max(max_runtime - (time.monotonic() - command_started), 0.0)
+        )
+        remaining_pages = (
+            None if max_pages is None else max(max_pages - pages_used, 0)
+        )
+        if (
+            (remaining_runtime is not None and remaining_runtime <= 0)
+            or (remaining_pages is not None and remaining_pages <= 0)
+        ):
+            break
+        log.info(
+            "Language partition %s/%s: %s",
+            len(partitions) + 1,
+            len(SUPPORTED_REVIEW_LANGUAGES),
+            language,
+        )
+        result = sync_reviews(
+            database=database,
+            app_id=app_id,
+            language=language,
+            start_date=start_date,
+            resume=resume,
+            max_pages=remaining_pages,
+            max_runtime=remaining_runtime,
+            overlap_pages=overlap_pages,
+            sync_updates=sync_updates,
+            verification_passes=verification_passes,
+        )
+        partitions.append(result)
+        pages_used += _pages_used(result)
+        if any(
+            phase and phase["reason"] == "user_interrupted"
+            for phase in _result_phases(result)
+        ):
+            break
+
+    with ReviewStore(database) as store:
+        completed_languages = {
+            language
+            for language in SUPPORTED_REVIEW_LANGUAGES
+            if (
+                (latest := store.get_latest_run(str(app_id), language, "recent"))
+                and latest["research_verified"]
+            )
+        }
+    all_verified = completed_languages == set(SUPPORTED_REVIEW_LANGUAGES)
+    if all_verified:
+        with ReviewStore(database) as store:
+            store.set_partitioned_coverage(
+                str(app_id),
+                SUPPORTED_REVIEW_LANGUAGES,
+                filter_type="recent",
+            )
+
+    expected_totals = [
+        result["recent"]["expected_reviews"]
+        for result in partitions
+        if result["recent"]["expected_reviews"] is not None
+    ]
+    with ReviewStore(database) as store:
+        stored_reviews = store.count_reviews(app_id)
+    return {
+        "database": database,
+        "app_id": str(app_id),
+        "language": "all",
+        "partition_strategy": "language",
+        "offtopic_reviews_included": False,
+        "languages_total": len(SUPPORTED_REVIEW_LANGUAGES),
+        "languages_attempted": len(partitions),
+        "languages_verified": len(completed_languages),
+        "pending_languages": [
+            language
+            for language in SUPPORTED_REVIEW_LANGUAGES
+            if language not in completed_languages
+        ],
+        "operational_complete": all_verified
+        or (
+            len(partitions) == len(SUPPORTED_REVIEW_LANGUAGES)
+            and all(result["operational_complete"] for result in partitions)
+        ),
+        "research_verified": all_verified,
+        "expected_reviews_sum": sum(expected_totals),
+        "partitions": partitions,
+        "stored_reviews": stored_reviews,
+    }
 
 
 def positive_int(value: str) -> int:
@@ -399,13 +697,23 @@ def main() -> int:
         description="Incrementally synchronize Steam reviews into a local SQLite archive."
     )
     parser.add_argument("appid", help="Steam application ID")
-    parser.add_argument("--language", default="all", help="Steam review language")
+    parser.add_argument(
+        "--language",
+        default="all",
+        help="Steam review language; 'all' uses independent language partitions",
+    )
     parser.add_argument("--start", help="Stop after reaching this date (dd/mm/yyyy)")
     parser.add_argument("--database", default=DEFAULT_DATABASE, help="SQLite database path")
     parser.add_argument("--resume", action="store_true", help="Resume a paused checkpoint")
     parser.add_argument("--max-pages", type=positive_int, default=None)
     parser.add_argument("--max-runtime", type=positive_float, default=None, metavar="SECONDS")
     parser.add_argument("--overlap-pages", type=positive_int, default=3)
+    parser.add_argument(
+        "--verification-passes",
+        type=positive_int,
+        default=3,
+        help="Maximum full passes used to verify a resumed/incomplete collection (default: 3)",
+    )
     parser.add_argument("--no-sync-updates", action="store_true")
     args = parser.parse_args()
 
@@ -415,19 +723,24 @@ def main() -> int:
         datefmt="%d/%m/%Y %H:%M:%S",
     )
     start_date = parse_date(args.start) if args.start else None
-    result = sync_reviews(
-        database=args.database,
-        app_id=args.appid,
-        language=map_language(args.language),
-        start_date=start_date,
-        resume=args.resume,
-        max_pages=args.max_pages,
-        max_runtime=args.max_runtime,
-        overlap_pages=args.overlap_pages,
-        sync_updates=not args.no_sync_updates,
-    )
+    language = map_language(args.language)
+    common_arguments = {
+        "database": args.database,
+        "app_id": args.appid,
+        "start_date": start_date,
+        "resume": args.resume,
+        "max_pages": args.max_pages,
+        "max_runtime": args.max_runtime,
+        "overlap_pages": args.overlap_pages,
+        "sync_updates": not args.no_sync_updates,
+        "verification_passes": args.verification_passes,
+    }
+    if language == "all":
+        result = sync_partitioned_reviews(**common_arguments)
+    else:
+        result = sync_reviews(language=language, **common_arguments)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    phases = (result["recent"], result["reconciliation"], result["updated"])
+    phases = _result_phases(result)
     if any(phase and phase["reason"] == "user_interrupted" for phase in phases):
         return 130
     return 0
