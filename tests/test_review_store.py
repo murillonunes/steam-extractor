@@ -219,6 +219,72 @@ class ReviewStoreTests(unittest.TestCase):
         self.assertEqual(aggregate["oldest_timestamp"], 100)
         self.assertEqual(aggregate["newest_timestamp"], 200)
 
+    def test_player_profiles_are_persisted_with_unavailable_statuses(self):
+        self.store.save_player_profiles(
+            [
+                {
+                    "steam_id": "available",
+                    "country_code": "BR",
+                    "status": "country_available",
+                },
+                {
+                    "steam_id": "no-country",
+                    "country_code": None,
+                    "status": "country_unavailable",
+                },
+            ]
+        )
+
+        profiles = self.store.get_player_profiles(
+            ["available", "no-country", "unknown"]
+        )
+
+        self.assertEqual(profiles["available"]["country_code"], "BR")
+        self.assertEqual(profiles["available"]["status"], "country_available")
+        self.assertIsNone(profiles["no-country"]["country_code"])
+        self.assertEqual(
+            profiles["no-country"]["status"], "country_unavailable"
+        )
+        self.assertNotIn("unknown", profiles)
+
+    def test_profile_candidates_exclude_terminal_states_and_respect_dates(self):
+        self.save(
+            "profile-seed",
+            [
+                review("available", timestamp=1704067200),
+                review("failed", timestamp=1706745600),
+                review("outside", timestamp=1672531200),
+            ],
+        )
+        self.store.save_player_profiles(
+            [
+                {
+                    "steam_id": "user-available",
+                    "country_code": "BR",
+                    "status": "country_available",
+                },
+                {
+                    "steam_id": "user-failed",
+                    "country_code": None,
+                    "status": "request_failed",
+                },
+            ]
+        )
+
+        candidates = self.store.get_profile_candidates(
+            "730", date(2024, 1, 1), date(2024, 12, 31)
+        )
+        summary = self.store.get_profile_enrichment_summary(
+            "730", date(2024, 1, 1), date(2024, 12, 31)
+        )
+
+        self.assertEqual(candidates, ["user-failed"])
+        self.assertEqual(summary["unique_authors"], 2)
+        self.assertEqual(summary["classified_users"], 1)
+        self.assertEqual(summary["request_failed_users"], 1)
+        self.assertEqual(summary["known_country_distribution"], {"BR": 1})
+        self.assertFalse(summary["complete"])
+
 
 class SyncResumeTests(unittest.TestCase):
     @patch("steam_extractor.reviews_sync.time.sleep")

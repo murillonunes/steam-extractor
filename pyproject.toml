@@ -18,6 +18,7 @@ steam-extractor      = "steam_extractor.tag_extractor:main"
 steam-reviews        = "steam_extractor.reviews_fetcher:main"
 steamspy-catalog     = "steam_extractor.catalog_fetcher:main"
 steam-reviews-sync   = "steam_extractor.reviews_sync:main"
+steam-profiles-sync  = "steam_extractor.profiles_sync:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

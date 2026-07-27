@@ -339,6 +339,211 @@ class ReviewStore:
         ).fetchall()
         return {str(row["recommendation_id"]) for row in rows}
 
+    def get_player_profiles(self, steam_ids: Iterable[str]) -> dict[str, dict]:
+        """Returns cached profile classifications for the requested Steam IDs."""
+        ids = list(dict.fromkeys(str(value) for value in steam_ids if value))
+        profiles: dict[str, dict] = {}
+        for offset in range(0, len(ids), 900):
+            batch = ids[offset : offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.connection.execute(
+                f"""
+                SELECT steam_id, country_code, status, checked_at
+                FROM player_profiles
+                WHERE steam_id IN ({placeholders})
+                """,
+                batch,
+            ).fetchall()
+            profiles.update({str(row["steam_id"]): dict(row) for row in rows})
+        return profiles
+
+    def save_player_profiles(self, profiles: Iterable[dict]) -> None:
+        """Persists one completed profile batch atomically for safe resumption."""
+        checked_at = utc_now()
+        rows = [
+            (
+                str(profile["steam_id"]),
+                profile.get("country_code") or None,
+                str(profile["status"]),
+                profile.get("checked_at") or checked_at,
+            )
+            for profile in profiles
+        ]
+        if not rows:
+            return
+        with self.transaction() as connection:
+            connection.executemany(
+                """
+                INSERT INTO player_profiles(steam_id, country_code, status, checked_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(steam_id) DO UPDATE SET
+                    country_code = excluded.country_code,
+                    status = excluded.status,
+                    checked_at = excluded.checked_at
+                """,
+                rows,
+            )
+
+    def get_profile_candidates(
+        self,
+        app_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        *,
+        refresh_profiles: bool = False,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Returns author IDs requiring profile enrichment without loading reviews."""
+        conditions = ["r.app_id = ?", "r.user_id IS NOT NULL", "r.user_id <> ''"]
+        parameters: list[object] = [str(app_id)]
+        if start_date is not None:
+            conditions.append("r.timestamp_created >= ?")
+            parameters.append(
+                int(
+                    datetime(
+                        start_date.year,
+                        start_date.month,
+                        start_date.day,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+            )
+        if end_date is not None:
+            conditions.append("r.timestamp_created <= ?")
+            parameters.append(
+                int(
+                    datetime(
+                        end_date.year,
+                        end_date.month,
+                        end_date.day,
+                        23,
+                        59,
+                        59,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+            )
+        if not refresh_profiles:
+            conditions.append(
+                "(p.steam_id IS NULL OR p.status = 'request_failed')"
+            )
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            parameters.append(int(limit))
+        rows = self.connection.execute(
+            f"""
+            SELECT r.user_id, MAX(r.timestamp_created) AS latest_review
+            FROM reviews AS r
+            LEFT JOIN player_profiles AS p ON p.steam_id = r.user_id
+            WHERE {" AND ".join(conditions)}
+            GROUP BY r.user_id
+            ORDER BY latest_review DESC, r.user_id
+            {limit_clause}
+            """,
+            parameters,
+        ).fetchall()
+        return [str(row["user_id"]) for row in rows]
+
+    def get_profile_enrichment_summary(
+        self,
+        app_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> dict:
+        """Summarizes profile states for distinct authors in a review interval."""
+        conditions = ["app_id = ?", "user_id IS NOT NULL", "user_id <> ''"]
+        parameters: list[object] = [str(app_id)]
+        if start_date is not None:
+            conditions.append("timestamp_created >= ?")
+            parameters.append(
+                int(
+                    datetime(
+                        start_date.year,
+                        start_date.month,
+                        start_date.day,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+            )
+        if end_date is not None:
+            conditions.append("timestamp_created <= ?")
+            parameters.append(
+                int(
+                    datetime(
+                        end_date.year,
+                        end_date.month,
+                        end_date.day,
+                        23,
+                        59,
+                        59,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+            )
+        rows = self.connection.execute(
+            f"""
+            WITH authors AS (
+                SELECT DISTINCT user_id
+                FROM reviews
+                WHERE {" AND ".join(conditions)}
+            )
+            SELECT COALESCE(p.status, 'not_checked') AS status, COUNT(*) AS count
+            FROM authors AS a
+            LEFT JOIN player_profiles AS p ON p.steam_id = a.user_id
+            GROUP BY COALESCE(p.status, 'not_checked')
+            """,
+            parameters,
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        country_rows = self.connection.execute(
+            f"""
+            WITH authors AS (
+                SELECT DISTINCT user_id
+                FROM reviews
+                WHERE {" AND ".join(conditions)}
+            )
+            SELECT p.country_code, COUNT(*) AS count
+            FROM authors AS a
+            JOIN player_profiles AS p ON p.steam_id = a.user_id
+            WHERE p.status = 'country_available'
+            GROUP BY p.country_code
+            ORDER BY count DESC, p.country_code
+            """,
+            parameters,
+        ).fetchall()
+        total = sum(counts.values())
+        classified = sum(
+            counts.get(status, 0)
+            for status in {
+                "country_available",
+                "country_unavailable",
+                "profile_unavailable",
+            }
+        )
+        available = counts.get("country_available", 0)
+        return {
+            "unique_authors": total,
+            "status_counts": counts,
+            "classified_users": classified,
+            "pending_users": counts.get("not_checked", 0),
+            "request_failed_users": counts.get("request_failed", 0),
+            "processing_coverage_percent": (
+                round(classified / total * 100, 2) if total else 100.0
+            ),
+            "country_availability_among_classified_percent": (
+                round(available / classified * 100, 2) if classified else 0.0
+            ),
+            "known_country_distribution": {
+                str(row["country_code"]): int(row["count"])
+                for row in country_rows
+            },
+            "complete": (
+                counts.get("not_checked", 0) == 0
+                and counts.get("request_failed", 0) == 0
+            ),
+        }
+
     def get_job(self, app_id: str, language: str, filter_type: str) -> dict | None:
         row = self.connection.execute(
             "SELECT * FROM sync_jobs WHERE job_key = ?",

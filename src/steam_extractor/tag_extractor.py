@@ -27,7 +27,8 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, date, timezone
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import pandas as pd
@@ -68,9 +69,11 @@ def setup_logging() -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_DB         = "steamspy_catalog.json"
+DEFAULT_PROFILE_DB = "steam_profiles.sqlite"
 PLAYER_SUMMARY_URL = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
 GAME_DELAY         = 1.5
 PROFILE_DELAY      = 0.5
+MAX_PROFILE_DELAY  = 5.0
 BATCH_SIZE         = 100
 
 
@@ -82,18 +85,67 @@ class CountryFetchResult:
     country_available: int
     failed_batches: int
     failed_users: int
+    status_map: dict[str, str] | None = None
+    cached_users: int = 0
+    newly_checked_users: int = 0
+    pending_users: int = 0
+    rate_limit_events: int = 0
+    retry_after_events: int = 0
+    retry_wait_seconds: float = 0.0
+    initial_request_delay: float = PROFILE_DELAY
+    final_request_delay: float = PROFILE_DELAY
 
     def to_metadata(self) -> dict:
+        statuses = self.status_map or {}
+        unavailable = sum(
+            status == "country_unavailable" for status in statuses.values()
+        )
+        classified = sum(
+            status
+            in {
+                "country_available",
+                "country_unavailable",
+                "profile_unavailable",
+            }
+            for status in statuses.values()
+        )
+        attempted = classified + sum(
+            status == "request_failed" for status in statuses.values()
+        )
         return {
             "unique_authors": self.requested_users,
             "profiles_returned": self.returned_profiles,
             "country_available": self.country_available,
-            "country_unavailable": (
-                self.requested_users - self.country_available - self.failed_users
+            "country_unavailable": unavailable,
+            "profile_unavailable": sum(
+                status == "profile_unavailable" for status in statuses.values()
+            ),
+            "request_failed": sum(
+                status == "request_failed" for status in statuses.values()
             ),
             "failed_batches": self.failed_batches,
             "failed_users": self.failed_users,
-            "complete": self.failed_batches == 0,
+            "cached_users": self.cached_users,
+            "newly_checked_users": self.newly_checked_users,
+            "pending_users": self.pending_users,
+            "rate_limit_events": self.rate_limit_events,
+            "retry_after_events": self.retry_after_events,
+            "retry_wait_seconds": round(self.retry_wait_seconds, 2),
+            "initial_request_delay": self.initial_request_delay,
+            "final_request_delay": round(self.final_request_delay, 2),
+            "attempted_users": attempted,
+            "classified_users": classified,
+            "processing_coverage_percent": (
+                round(classified / self.requested_users * 100, 2)
+                if self.requested_users
+                else 100.0
+            ),
+            "country_availability_among_classified_percent": (
+                round(self.country_available / classified * 100, 2)
+                if classified
+                else 0.0
+            ),
+            "complete": self.failed_batches == 0 and self.pending_users == 0,
         }
 
 
@@ -168,7 +220,13 @@ def get_appids_by_tags(
 # ---------------------------------------------------------------------------
 
 def fetch_country_codes_with_metadata(
-    user_ids: list[str], api_key: str
+    user_ids: list[str],
+    api_key: str,
+    *,
+    store: ReviewStore | None = None,
+    max_batches: int | None = None,
+    max_runtime: float | None = None,
+    refresh_profiles: bool = False,
 ) -> CountryFetchResult:
     """
     Fetches country_code for a list of Steam user IDs via GetPlayerSummaries.
@@ -176,18 +234,97 @@ def fetch_country_codes_with_metadata(
 
     Returns dict mapping steamid → country_code (empty string if unavailable).
     """
-    country_map: dict[str, str] = {}
+    user_ids = list(dict.fromkeys(str(value) for value in user_ids if value))
+    cached = store.get_player_profiles(user_ids) if store else {}
+    terminal_statuses = {
+        "country_available",
+        "country_unavailable",
+        "profile_unavailable",
+    }
+    reusable = (
+        {}
+        if refresh_profiles
+        else {
+            steam_id: profile
+            for steam_id, profile in cached.items()
+            if profile["status"] in terminal_statuses
+        }
+    )
+    country_map = {
+        steam_id: profile.get("country_code") or ""
+        for steam_id, profile in reusable.items()
+    }
+    status_map = {
+        steam_id: str(profile["status"]) for steam_id, profile in reusable.items()
+    }
     returned_profiles = 0
     failed_batches = 0
     failed_users = 0
-    batches = [user_ids[i:i + BATCH_SIZE] for i in range(0, len(user_ids), BATCH_SIZE)]
+    pending_ids = [steam_id for steam_id in user_ids if steam_id not in reusable]
+    batches = [
+        pending_ids[i:i + BATCH_SIZE]
+        for i in range(0, len(pending_ids), BATCH_SIZE)
+    ]
+    started = time.monotonic()
+    processed_users = 0
+    runtime_exhausted = False
+    request_delay = PROFILE_DELAY
+    successful_batches = 0
+    rate_limit_events = 0
+    retry_after_events = 0
+    retry_wait_seconds = 0.0
 
-    log.info(f"Fetching player profiles: {len(user_ids):,} users in {len(batches)} batches")
+    def retry_after_seconds(response) -> float | None:
+        value = response.headers.get("Retry-After") if response is not None else None
+        if not value:
+            return None
+        try:
+            return max(float(value), 0.0)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(
+                    (retry_at - datetime.now(tz=timezone.utc)).total_seconds(),
+                    0.0,
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    def wait_within_runtime(seconds: float) -> bool:
+        """Waits for a retry without crossing the configured command deadline."""
+        if max_runtime is None:
+            time.sleep(seconds)
+            return True
+        remaining = max_runtime - (time.monotonic() - started)
+        if remaining <= 0:
+            return False
+        time.sleep(min(seconds, remaining))
+        return seconds < remaining
+
+    log.info(
+        "Player profiles: %s cached, %s pending in %s batches",
+        len(reusable),
+        len(pending_ids),
+        len(batches),
+    )
 
     for i, batch in enumerate(batches, start=1):
+        if max_batches is not None and i > max_batches:
+            break
+        if max_runtime is not None and time.monotonic() - started >= max_runtime:
+            break
         max_retries = 3
         batch_succeeded = False
+        players: list[dict] = []
         for attempt in range(max_retries):
+            if (
+                max_runtime is not None
+                and time.monotonic() - started >= max_runtime
+            ):
+                runtime_exhausted = True
+                break
             try:
                 r = requests.get(
                     PLAYER_SUMMARY_URL,
@@ -197,35 +334,151 @@ def fetch_country_codes_with_metadata(
                 r.raise_for_status()
                 players = r.json().get("response", {}).get("players", [])
                 returned_profiles += len(players)
-                for player in players:
-                    steamid = player.get("steamid", "")
-                    country = player.get("loccountrycode", "")
-                    country_map[steamid] = country.upper() if country else ""
                 batch_succeeded = True
+                successful_batches += 1
+                if successful_batches % 10 == 0 and request_delay > PROFILE_DELAY:
+                    previous_delay = request_delay
+                    request_delay = max(PROFILE_DELAY, request_delay * 0.9)
+                    log.info(
+                        "Adaptive profile delay reduced from %.2fs to %.2fs "
+                        "after 10 successful batches",
+                        previous_delay,
+                        request_delay,
+                    )
                 break
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
                 if status == 429:
-                    wait = 30 * (attempt + 1)
-                    log.warning(f"Rate limited on batch {i} (attempt {attempt+1}/{max_retries}), waiting {wait}s...")
-                    time.sleep(wait)
+                    rate_limit_events += 1
+                    successful_batches = 0
+                    request_delay = min(
+                        MAX_PROFILE_DELAY,
+                        max(1.0, request_delay * 1.5),
+                    )
+                    retry_after = retry_after_seconds(e.response)
+                    if retry_after is not None:
+                        retry_after_events += 1
+                    if attempt < max_retries - 1:
+                        wait = (
+                            retry_after
+                            if retry_after is not None
+                            else 30 * (attempt + 1)
+                        )
+                        retry_wait_seconds += wait
+                        log.warning(
+                            "Rate limited on batch %s (attempt %s/%s), waiting "
+                            "%.1fs; adaptive delay now %.2fs%s",
+                            i,
+                            attempt + 1,
+                            max_retries,
+                            wait,
+                            request_delay,
+                            " (Retry-After)" if retry_after is not None else "",
+                        )
+                        if not wait_within_runtime(wait):
+                            runtime_exhausted = True
+                            break
+                    else:
+                        log.warning(
+                            "Rate limited on batch %s (attempt %s/%s); no further "
+                            "retry for this batch, adaptive delay now %.2fs",
+                            i,
+                            attempt + 1,
+                            max_retries,
+                            request_delay,
+                        )
                 else:
                     log.warning(f"HTTP {status} error on batch {i} (attempt {attempt+1}/{max_retries})")
+                    if attempt < max_retries - 1 and not wait_within_runtime(
+                        2 ** attempt
+                    ):
+                        runtime_exhausted = True
+                        break
+            except requests.exceptions.RequestException as e:
+                wait = 2 ** attempt
+                log.warning(
+                    "Transport error on batch %s: %s (attempt %s/%s)",
+                    i,
+                    type(e).__name__,
+                    attempt + 1,
+                    max_retries,
+                )
+                if attempt < max_retries - 1 and not wait_within_runtime(wait):
+                    runtime_exhausted = True
                     break
             except Exception as e:
                 log.warning(f"Error on batch {i}: {type(e).__name__} (attempt {attempt+1}/{max_retries})")
                 break
 
+        if runtime_exhausted and not batch_succeeded:
+            log.info(
+                "Profile enrichment runtime reached before batch %s completed; "
+                "the batch remains pending",
+                i,
+            )
+            break
+
         if not batch_succeeded:
             failed_batches += 1
             failed_users += len(batch)
+            failed_profiles = []
+            for steam_id in batch:
+                previous = cached.get(steam_id)
+                if previous and previous["status"] in terminal_statuses:
+                    country_map[steam_id] = previous.get("country_code") or ""
+                    status_map[steam_id] = str(previous["status"])
+                    continue
+                status_map[steam_id] = "request_failed"
+                failed_profiles.append(
+                    {
+                        "steam_id": steam_id,
+                        "country_code": None,
+                        "status": "request_failed",
+                    }
+                )
+            if store:
+                store.save_player_profiles(failed_profiles)
+        else:
+            returned = {
+                str(player.get("steamid")): player
+                for player in players
+                if player.get("steamid")
+            }
+            batch_profiles = []
+            for steam_id in batch:
+                player = returned.get(steam_id)
+                country = (
+                    str(player.get("loccountrycode") or "").upper()
+                    if player
+                    else ""
+                )
+                status = (
+                    "country_available"
+                    if country
+                    else "country_unavailable"
+                    if player
+                    else "profile_unavailable"
+                )
+                country_map[steam_id] = country
+                status_map[steam_id] = status
+                batch_profiles.append(
+                    {
+                        "steam_id": steam_id,
+                        "country_code": country or None,
+                        "status": status,
+                    }
+                )
+            if store:
+                store.save_player_profiles(batch_profiles)
+        processed_users += len(batch)
 
         if i % 10 == 0:
             log.info(f"Profile batch {i}/{len(batches)} done")
 
-        time.sleep(PROFILE_DELAY)
+        if not wait_within_runtime(request_delay):
+            break
 
-    filled = sum(1 for v in country_map.values() if v)
+    filled = sum(1 for steam_id in user_ids if country_map.get(steam_id))
     total  = len(user_ids)
     if total:
         log.info(f"country_code found for {filled:,} / {total:,} users ({filled/total*100:.1f}%)")
@@ -237,6 +490,15 @@ def fetch_country_codes_with_metadata(
         country_available=filled,
         failed_batches=failed_batches,
         failed_users=failed_users,
+        status_map=status_map,
+        cached_users=len(reusable),
+        newly_checked_users=processed_users,
+        pending_users=max(len(pending_ids) - processed_users, 0),
+        rate_limit_events=rate_limit_events,
+        retry_after_events=retry_after_events,
+        retry_wait_seconds=retry_wait_seconds,
+        initial_request_delay=PROFILE_DELAY,
+        final_request_delay=request_delay,
     )
 
 
@@ -263,18 +525,23 @@ def extract_reviews_by_tags(
     game_delay: float = GAME_DELAY,
     review_database: str | None = None,
     allow_unverified_cache: bool = False,
+    profile_database: str | None = None,
+    profile_max_batches: int | None = None,
+    profile_max_runtime: float | None = None,
+    refresh_profiles: bool = False,
 ) -> pd.DataFrame:
     """
     Full pipeline:
         1. Local catalog → app IDs per tag
         2. Steam API     → reviews per app
         3. GetPlayerSummaries → country_code per user (batched)
-        4. Filter by country (if --countries specified)
+        4. Filter known countries while retaining unresolved country records
         5. Return structured DataFrame
 
     Output columns:
         app_id, app_name, recommendation_id, review_version, review_content_hash,
-        user_id, country_code, language, review_text, voted_up, tag, date_created
+        user_id, country_code, country_status, language, review_text, voted_up,
+        tag, date_created
     """
     catalog, catalog_metadata = load_catalog_with_metadata(db_path)
     all_rows        = []
@@ -307,6 +574,10 @@ def extract_reviews_by_tags(
                 "steam_filter": "recent",
                 "offtopic_included": False,
                 "review_database": review_database,
+                "profile_database": profile_database,
+                "profile_max_batches": profile_max_batches,
+                "profile_max_runtime": profile_max_runtime,
+                "refresh_profiles": refresh_profiles,
                 "allow_unverified_cache": allow_unverified_cache,
             },
             "catalog": {**catalog_metadata, "path": db_path},
@@ -469,21 +740,126 @@ def extract_reviews_by_tags(
     # Step 3: enrich with country_code via GetPlayerSummaries
     # ------------------------------------------------------------------
     unique_users = df["user_id"].dropna().unique().tolist()
-    country_result = fetch_country_codes_with_metadata(unique_users, api_key)
+    profile_store_path = profile_database or review_database
+    if profile_store_path:
+        with ReviewStore(profile_store_path) as profile_store:
+            country_result = fetch_country_codes_with_metadata(
+                unique_users,
+                api_key,
+                store=profile_store,
+                max_batches=profile_max_batches,
+                max_runtime=profile_max_runtime,
+                refresh_profiles=refresh_profiles,
+            )
+    else:
+        country_result = fetch_country_codes_with_metadata(
+            unique_users,
+            api_key,
+            max_batches=profile_max_batches,
+            max_runtime=profile_max_runtime,
+            refresh_profiles=refresh_profiles,
+        )
     df["country_code"] = df["user_id"].map(country_result.country_map).fillna("")
+    status_map = country_result.status_map or {
+        steam_id: (
+            "country_available" if country else "country_unavailable"
+        )
+        for steam_id, country in country_result.country_map.items()
+    }
+    df["country_status"] = (
+        df["user_id"].map(status_map).fillna("not_checked")
+    )
     reviews_before_country_filter = len(df)
+    available_country = df["country_status"] == "country_available"
+
+    def coverage_by(column: str) -> dict[str, dict]:
+        summary = {}
+        for value, group in df.groupby(column, dropna=False):
+            total = len(group)
+            statuses = group["country_status"]
+            available = int((statuses == "country_available").sum())
+            unavailable = int((statuses == "country_unavailable").sum())
+            profile_unavailable = int((statuses == "profile_unavailable").sum())
+            request_failed = int((statuses == "request_failed").sum())
+            not_checked = int((statuses == "not_checked").sum())
+            classified = available + unavailable + profile_unavailable
+            attempted = classified + request_failed
+            summary[str(value or "unknown")] = {
+                "reviews_total": total,
+                "attempted_reviews": attempted,
+                "classified_reviews": classified,
+                "country_available_reviews": available,
+                "country_unavailable_reviews": unavailable,
+                "profile_unavailable_reviews": profile_unavailable,
+                "request_failed_reviews": request_failed,
+                "not_checked_reviews": not_checked,
+                "processing_coverage_percent": round(
+                    classified / total * 100, 2
+                ),
+                "country_availability_among_classified_percent": (
+                    round(available / classified * 100, 2)
+                    if classified
+                    else 0.0
+                ),
+            }
+        return summary
+
+    review_status_counts = {
+        str(status): int(count)
+        for status, count in df["country_status"].value_counts().items()
+    }
+    author_status_counts = {
+        str(status): int(count)
+        for status, count in pd.Series(
+            unique_users, dtype="object"
+        ).map(status_map).fillna("not_checked").value_counts().items()
+    }
+    country_distribution = {
+        str(country): int(count)
+        for country, count in df.loc[
+            available_country, "country_code"
+        ].value_counts().items()
+    }
+    df["_review_year"] = df["date_created"].str[-4:].fillna("unknown")
+    language_coverage = coverage_by("language")
+    year_coverage = coverage_by("_review_year")
+    df.drop(columns=["_review_year"], inplace=True)
 
     # ------------------------------------------------------------------
     # Step 4: filter by country
     # ------------------------------------------------------------------
     if countries_upper:
         before = len(df)
-        df     = df[df["country_code"].isin(countries_upper)]
-        log.info(f"Filter: kept {len(df):,} / {before:,} reviews matching countries: {', '.join(countries_upper)}")
+        country_matches = df["country_code"].isin(countries_upper)
+        unresolved = df["country_status"] != "country_available"
+        matched_reviews = int(country_matches.sum())
+        unresolved_reviews = int((~country_matches & unresolved).sum())
+        df = df[country_matches | unresolved]
+        log.info(
+            "Filter: retained %s/%s reviews (%s matching %s; %s with unavailable "
+            "or pending country)",
+            len(df),
+            before,
+            matched_reviews,
+            ", ".join(countries_upper),
+            unresolved_reviews,
+        )
+    else:
+        matched_reviews = len(df)
+        unresolved_reviews = int(
+            (df["country_status"] != "country_available").sum()
+        )
 
     country_metadata = country_result.to_metadata()
     country_metadata["reviews_before_filter"] = reviews_before_country_filter
-    country_metadata["reviews_matching_filter"] = len(df)
+    country_metadata["author_status_counts"] = author_status_counts
+    country_metadata["review_status_counts"] = review_status_counts
+    country_metadata["known_country_distribution_reviews"] = country_distribution
+    country_metadata["coverage_by_language"] = language_coverage
+    country_metadata["coverage_by_year"] = year_coverage
+    country_metadata["reviews_matching_filter"] = matched_reviews
+    country_metadata["reviews_unresolved_retained"] = unresolved_reviews
+    country_metadata["reviews_after_filter"] = len(df)
     df.attrs["extraction_metadata"] = build_metadata(country_metadata)
 
     if df.empty:
@@ -531,6 +907,20 @@ def save_output(df: pd.DataFrame, filename: str, format_type: str = "csv") -> No
 # CLI
 # ---------------------------------------------------------------------------
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Tag Extractor — collects Steam reviews by genre/category and country.",
@@ -564,6 +954,30 @@ Examples:
                         help=f"Path to local SteamSpy catalog (default: {DEFAULT_DB})")
     parser.add_argument("--review-db",   default=None,
                         help="Optional SQLite review archive; reuse it when coverage is complete")
+    parser.add_argument(
+        "--profile-db",
+        default=None,
+        help="SQLite profile cache (default: --review-db, or steam_profiles.sqlite)",
+    )
+    parser.add_argument(
+        "--profile-max-batches",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Pause profile enrichment after N API batches; completed batches are cached",
+    )
+    parser.add_argument(
+        "--profile-max-runtime",
+        type=positive_float,
+        default=None,
+        metavar="SECONDS",
+        help="Pause profile enrichment after this wall-clock duration",
+    )
+    parser.add_argument(
+        "--refresh-profiles",
+        action="store_true",
+        help="Query terminal cached profiles again instead of reusing them",
+    )
     parser.add_argument("--allow-unverified-cache", action="store_true",
                         help="Allow resumed SQLite coverage that could not be fully verified; "
                              "the manifest will mark the dataset incomplete")
@@ -627,6 +1041,10 @@ Examples:
         game_delay=args.game_delay,
         review_database=args.review_db,
         allow_unverified_cache=args.allow_unverified_cache,
+        profile_database=args.profile_db or args.review_db or DEFAULT_PROFILE_DB,
+        profile_max_batches=args.profile_max_batches,
+        profile_max_runtime=args.profile_max_runtime,
+        refresh_profiles=args.refresh_profiles,
     )
 
     if args.output:
