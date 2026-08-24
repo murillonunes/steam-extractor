@@ -7,13 +7,14 @@
 
 ## Overview
 
-This project is a Python package with four CLI tools that work together:
+This project is a Python package with five CLI tools that work together:
 
 | Command | Description |
 |---------|-------------|
 | `steamspy-catalog` | Builds a local SteamSpy catalog with tags for all games (run once) |
 | `steam-reviews` | Extracts reviews for a single game by appid, language and date range |
 | `steam-reviews-sync` | Incrementally archives and versions reviews in local SQLite |
+| `steam-profiles-sync` | Resumably enriches archived review authors with country metadata |
 | `steam-extractor` | Full pipeline: discovers games by tag, collects reviews, enriches with country |
 
 ## Features
@@ -113,6 +114,10 @@ The API key can also be provided via the `STEAM_API_KEY` environment variable in
 | `--db` | Path to local SteamSpy catalog | `steamspy_catalog.json` |
 | `--review-db` | Optional SQLite archive reused when interval coverage is complete | — |
 | `--allow-unverified-cache` | Reuse resumed cursor coverage, marking the dataset incomplete | disabled |
+| `--profile-db` | Persistent SQLite cache for country lookup results (defaults to `--review-db`, then `steam_profiles.sqlite`) | automatic |
+| `--profile-max-batches N` | Pause country enrichment after N API batches; completed batches remain cached | unlimited |
+| `--profile-max-runtime SECONDS` | Pause country enrichment after the requested duration | unlimited |
+| `--refresh-profiles` | Query terminal cached profiles again | disabled |
 
 ```bash
 # Set API key once in the environment (keeps it out of shell history):
@@ -217,6 +222,44 @@ If verified local coverage is unavailable, `steam-extractor` logs that fact and 
 to the Steam API. The research manifest records whether each game came from `sqlite_cache`
 or `steam_api`.
 
+Country enrichment is also resumable. Each completed profile batch is persisted in the
+profile database. Authors are classified as `country_available`, `country_unavailable`
+(profile returned without a declared country), `profile_unavailable` (profile not returned),
+or `request_failed` (transient lookup failure). Later runs reuse terminal results and retry
+only failures or authors not yet checked. Rate limits and transport errors such as timeouts
+use bounded retries; `Retry-After` is honored when Steam provides it. The normal request
+delay increases after HTTP 429 and decreases gradually after successful batches. Runtime
+limits also apply to retry backoff, leaving an unfinished batch pending instead of exceeding
+the configured deadline. Results report rate-limit events, retry waits, and initial/final
+request delays. The manifest records the profile batch, runtime and refresh options used by
+the command.
+
+When `--countries` is used, reviews with another known country are filtered out, but reviews
+whose country is unavailable, pending, or failed are retained with an explicit
+`country_status`. This prevents missing profile information from being silently discarded.
+The research manifest reports author and review status counts, the known-country
+distribution, and country coverage by language and year. Coverage metrics keep
+`processing_coverage_percent` (classified records divided by all requested records)
+separate from `country_availability_among_classified_percent` (records with a country
+divided only by successfully classified records), so a partial run is not mistaken for
+low profile availability.
+
+For large archives, use the dedicated profile command. It reads only distinct author IDs
+from SQLite, does not load review text, and does not generate a CSV:
+
+```bash
+steam-profiles-sync 1091500 \
+    --database data/cyberpunk_2077_reviews.sqlite \
+    --start 10/12/2020 --end 26/07/2026 \
+    --max-runtime 1800
+```
+
+Repeat the same command to continue. Terminal profile states are reused, transient failures
+are retried, and every invocation prints JSON summaries for the state before and after the
+run, including status counts, processing coverage, country availability and known-country
+distribution. `--max-batches N` can be used instead of or together with the runtime limit.
+Use `--refresh-profiles` only when previously classified profiles should be queried again.
+
 A cursor resumed across separate processes cannot by itself prove that the live Steam stream
 did not shift at the boundary. Such data becomes verified only after the independent
 full-pass convergence described above. Data that has not converged remains stored but is not
@@ -235,6 +278,7 @@ conservative default.
 | `review_content_hash` | SHA-256 of research-relevant mutable review fields |
 | `user_id` | Steam user ID (steamid64) |
 | `country_code` | ISO 3166-1 alpha-2 (e.g. `BR`, `US`) |
+| `country_status` | Country lookup status; distinguishes available, unavailable, missing profiles and transient failures |
 | `language` | Review language |
 | `review_text` | Review content |
 | `voted_up` | `True` / `False` |

@@ -32,6 +32,11 @@ logs/
 # Sensitive data
 .env
 
+# Local ad-hoc scripts (not part of the package)
+build_recorte_br_cn_us.py
+build_pilot_stratified.py
+build_empty_text_audit.py
+
 # Generated data / outputs
 *.json
 *.csv
